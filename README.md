@@ -174,10 +174,18 @@ three before): `expected` *is* the answer for `json_equals`/`set_eq`/`exact`; it
 answer must satisfy for `count`/`schema`/`union_eq`/`subset_of`; it is what the answer must mention
 for `covers`/`all_of`; and for `json_order` the answer is the sequence of objects that produces the
 given order. `python_exec`, `python_check`, `regex` and `citation` carry a program or an evidence
-report and still need `prove.positive` from the caller. When a **derived** positive fails, the report
-says so and names both possible causes — an unsatisfiable constraint (a schema with no instance, a
-pattern `x` cannot satisfy) or a gate that rejects the right answer — because the caller cannot tell
-them apart otherwise.
+report and still need `prove.positive` from the caller — and those same four are excluded from
+**structural mutation** entirely (`UNSTRUCTURED_KINDS` in the module), because their gate does not read
+the answer's structure. `citation` is the case that forced it: its positive happens to be JSON, so the
+generic operators *did* fire on it — `perturbNumber` moved a line number, `dropField` dropped a field —
+the citation gate correctly ignored both, and the proof reported `accepts 2/6 wrong answers` against a
+gate that was perfectly fine. That is a false alarm arriving through a different door than the
+`semantics` flags guard. For those four, `prove` now answers "this kind cannot be certified
+automatically — check both halves by hand" instead of inventing leakage.
+
+When a **derived** positive fails, the report says so and names both possible causes — an
+unsatisfiable constraint (a schema with no instance, a pattern `x` cannot satisfy) or a gate that
+rejects the right answer — because the caller cannot tell them apart otherwise.
 
 `semantics` switches (`hasIdentityField`, `hasEnums`, `closedVocabulary`, `closedShape`,
 `textAnswer`) exist because a mutant that is still correct is a false alarm, and a false alarm
@@ -185,7 +193,10 @@ condemns a gate that is actually fine. Leaving one off is the caller's honest ju
 mutant would not really be wrong. Two of them are false alarms for specific kinds, both measured and
 pinned by a test: `closedShape` for `json_order` (an extra field is invisible to a field-order gate)
 and `duplicateItem` for `set_eq` (a set cannot see a duplicate). **Zero mutants is not a pass** — it
-means nothing was proven.
+means nothing was proven. The *rejected-positive* check is deliberately ordered **before** that
+verdict: the four unstructured kinds always report zero mutants, so testing `total` first would report
+a gate that rejects the right answer as the innocuous "cannot certify this kind", and the caller would
+ship a gate that fails every delegation.
 
 Measured on this preset's own verifiers: `schema: {"type":"array"}` accepts every mutant (no
 discriminating power), while `json_equals` against its own `expected` rejects all of them.
@@ -511,9 +522,10 @@ refused batch is reported per task rather than thrown.
 | File | Role |
 |---|---|
 | `cordis.patch.yml` | **Generated.** The preset declaration: the shipped `standard` plugin list verbatim, then the one added row |
-| `local-delegate.mjs` | The added capability: verifiers, `delegate_batch` (text + images), the routing guide |
-| `local-delegate.selftest.mjs` | 178 deterministic cases, each pinning a behaviour or a defect; ten mutations of the module (a kind dropped from the table, the positive-acceptance half of `prove` reverted, the payload never persisted, `citation` back to single-line, `wholeWord` dropped, boundaries tested on squashed text, the child predicate disabled, the section back to a plain string, the stop reason ignored, the batch footer dropped) are each caught by the case meant to catch them |
+| `local-delegate.mjs` | The added capability: verifiers, `delegate_batch` (text + images), the routing guide for the top-level agent, and the short child notes for a delegated child |
+| `local-delegate.selftest.mjs` | 195 deterministic cases, each pinning a behaviour or a defect; mutations of the module (a kind dropped from the table, the positive-acceptance half of `prove` reverted, the payload never persisted, `citation` back to single-line, `wholeWord` dropped, boundaries tested on squashed text, the child predicate disabled, the section back to a plain string, the stop reason ignored, the batch footer dropped) are each caught by the case meant to catch them |
 | `package.json` | Bundle manifest: `dsh.bundle.patch`, and the `exports` map the module subpath resolves through |
+| `scripts/subagent-trace.mjs` | Reads any session's or child's `session.v4.jsonl.zstd` — walking **every** appended frame, since `zstdDecompressSync` decodes only the first — and prints a timeline or the raw JSONL (`--last`, `--watch`, `--raw`, `--json`). Not copied by `sync-install.mjs`; run it from this directory |
 | `scripts/sync-install.mjs` | Copies this tree into the profile's pnpm copy (pnpm will not re-copy a changed non-manifest file) |
 | `../../tools/build-local-delegate-preset.py` | Regenerates `cordis.patch.yml` from this build's own app.asar |
 | `../../tools/dump-shipped-preset.py` | Prints a shipped preset's plugin list, for diffing |
@@ -526,7 +538,7 @@ refused batch is reported per task rather than thrown.
 node local-delegate.selftest.mjs
 ```
 
-178 cases: fence tolerance, a malformed schema that must not pass everything,
+195 cases: fence tolerance, a malformed schema that must not pass everything,
 `additionalProperties:false` and `minLength` enforced, integer vs number, a looping answer
 reported as repetition rather than as malformed JSON, an empty answer blamed on the engine, the
 gate never throwing on wrong-typed payloads, the `def`-extraction bug above, the exact
@@ -547,14 +559,22 @@ checked against its own gate, plus the two false-alarm rules (`closedShape`/`jso
 behind). Each of those was verified to have discriminating power by mutating the module and requiring
 the matching case to fail.
 
+Two more were pinned because the module grew. A **`citation` gate is never structurally mutated**: the
+region must report zero mutants *and* an accepted positive — the assertion that separates "we chose not
+to mutate this kind" from "the positive happened to be broken". And the **withdrawn `engine_info` tool
+must NOT be registered** — it was built, failed with `content.some is not a function` in two parameter
+shapes, and was removed; the case keeps it removed.
+
 Four more came from the same discipline. `wholeWord` was added because `covers` passed a false
 answer, and its boundary test runs on space-preserving text rather than on `squash` (the case for
 that catches a mutation which would otherwise be invisible). `citation`'s `span` was added because
 single-line matching called a real two-line quotation fake, and `span: 1` is pinned as the strict
-alternative. The child-prompt suppression is pinned from both sides — the guide must be present for a
-top-level agent and absent for a child, by header depth and by runtime depth — plus a case that an
-unreadable context keeps it. And the stop-reason rule is pinned with a *passing* answer that must
-fail anyway, which is the only shape that proves the stop reason outranks the verifier.
+alternative. The child prompt is pinned from both sides — the full routing guide must be present for a
+top-level agent and **absent** for a child (which now receives the short child notes instead, measured
+at 625 characters against the guide's 9,778), by header depth and by runtime depth — plus a case that
+an unreadable context keeps it, and a length-ratio case (>3× shorter). And the stop-reason rule is
+pinned with a *passing* answer that must fail anyway, which is the only shape that proves the stop
+reason outranks the verifier.
 
 The suite drives `apply` with a minimal fake context on purpose: `import` proves a module
 evaluates, never that its handlers run.
@@ -679,19 +699,31 @@ These are stated rather than hidden, in the same spirit as the measurements abov
   Two measurements first. `toolFilter: { allow: [] }` does exactly what it claims: delegations from a
   session on this preset read `prompt 3522` and `prompt 3576 tokens` in the engine log, against a
   **12,401**-token baseline without the strip, so the tool schemas are gone. But what remained was
-  mostly the child's *inherited prompt sections*, and this preset's own GUIDE is 6,679 characters =
-  **1,633 prompt tokens** (measured through the engine's `usage.prompt_tokens`), about **46%** of the
-  ~3,540-token child prompt — paid on every single delegation, for text a child that cannot call
-  `delegate_batch` can do nothing with. The harness cannot fix this: `applyChildComposition` joins the
-  parent's preset *generation* (read out of the **running build**, see the version boundary below), so
-  a plugin's `apply` is never re-run for a child, and the only per-child overrides are
+  mostly the child's *inherited prompt sections*, and this preset's own GUIDE was 6,679 characters =
+  **1,633 prompt tokens** at the time of that measurement (read through the engine's
+  `usage.prompt_tokens`), about **46%** of the ~3,540-token child prompt — paid on every single
+  delegation. The harness cannot fix this: `applyChildComposition` joins the parent's preset
+  *generation* (read out of the **running build**, see the version boundary below), so a plugin's
+  `apply` is never re-run for a child, and the only per-child overrides are
   `deployment:persona-prefix` and a tool restriction. The fix is the section's own `text` callback —
-  the shape `plan-mode` already uses for its policy section. It is a FUNCTION now and returns `''`
-  when the request belongs to a delegated child. The predicate is the harness's own depth rule
+  the shape `plan-mode` already uses for its policy section. It is a FUNCTION now, so it can answer
+  per request. The predicate is the harness's own depth rule
   (`max(session.header.delegationDepth, options.subagentDepth)`, zero for a top-level agent), read
   defensively without importing the package, and anything unreadable keeps the guide: hiding it from
   the top-level agent would remove the routing rules this preset exists for, while showing it to a
-  child only costs tokens. **Closed — measured from a session that loaded this revision**: one
+  child only costs tokens.
+
+  **A child is no longer told NOTHING, and that changed for a measured reason.** The original callback
+  returned `''` for a child, on the premise "a delegated child has no tools here and cannot delegate".
+  That premise held while `maxDepth` was 1; raising it made the premise false, because a child CAN now
+  call `subagent`. The observed failures are exactly what the replacement prevents: one child spent 33
+  of its 34 steps cycling between a hallucinated tool name and a depth-refused `subagent`, and another
+  burned two steps polling `job_output`/`job_list` for a subagent id. So a child now receives
+  **`CHILD_GUIDE`** — three sentences: do the task you were given, do not hunt for a model to
+  re-delegate to, and pass `run_in_background: false` if a step genuinely needs `subagent`. It is
+  deliberately far shorter than the routing guide: measured **625 characters ≈ 153 tokens** against the
+  guide's **9,778 characters ≈ 2,391 tokens** as the guide now stands (it grew by the capacity note and
+  the async note). The routing *policy* still never reaches a child. **Closed — measured from a session that loaded this revision**: one
   `delegate_batch` task with its text inline read `strata serve: prompt 1963 tokens = 0 reused +
   1963 read` in the engine log. The `0 reused` is a cold prefill, not a cache miss: the top-level
   agent's prompt is not shared with anything, and the guide is the only thing that changed. 1,963
@@ -702,8 +734,10 @@ These are stated rather than hidden, in the same spirit as the measurements abov
   `attempts=1 · 0 retried`): `prompt 1587 tokens = 0 reused + 1587 read` for the same one-task text
   shape. All three land far below the tool-strip-only 3,522 and inside the predicted band. The
   exact figure drifts between sessions (1,963 / 1,952 / 1,587, ~370 tokens of spread) and that drift
-  is *not* the guide — the guide is 1,633 tokens, and it is the one thing these sessions share as
-  absent; the spread tracks other session-level prompt content and was not investigated further.
+  is *not* the guide — at the time of those runs the guide was 1,633 tokens and was the one thing
+  these sessions shared as absent; the spread tracks other session-level prompt content and was not
+  investigated further. With `CHILD_GUIDE` in place the same figure should sit roughly 150 tokens
+  higher; that prediction has not been re-measured.
 - **A `delegate_batch` task has no tools — by this preset's own choice, not by the engine's limit.**
   A delegated *child* does inherit its parent's composition, and on this engine a child called
   `read` and answered from the file, then called `glob` and `read_image` and read a picture
