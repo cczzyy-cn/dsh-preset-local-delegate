@@ -52,7 +52,7 @@ node local-delegate.selftest.mjs       # 195 个确定性用例
 |---|---|
 | `verify_task` | 单独执行一次校验 |
 | `delegate_batch` | **派发 + 校验一体**：文本与图像，顺序执行 |
-| 一段 prompt 段落 | 顶层 agent 得到完整 **GUIDE**（约 2,000 tokens）；**子代理由 `CHILD_GUIDE`（约 170 tokens）** |
+| 一段 prompt 段落 | 顶层 agent 得到完整 **GUIDE**（9,778 字符 ≈ 2,391 tokens）；**子代理得到 `CHILD_GUIDE`（625 字符 ≈ 153 tokens）**，比例约 **15.6 : 1** |
 
 **为什么子代理也有一小段**：原来子代理是**什么都不给**的，前提是"子代理没有工具、不能委派"。一旦 `maxDepth` 提到 1 以上，这个前提就不成立了——实测有子代理把 34 步里的 33 步耗在"幻觉工具 + 被深度拒绝的 `subagent`"之间循环。`CHILD_GUIDE` 只讲两个陷阱：**别去 `list_subagent_models` 找模型转包**、**真要调 `subagent` 就传 `run_in_background: false`**。
 
