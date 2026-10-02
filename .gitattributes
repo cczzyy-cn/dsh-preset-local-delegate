@@ -1,0 +1,5 @@
+# Normalize every text file to LF in the index AND on checkout.
+# Why: core.autocrlf=true on this machine made git add warn "LF will be replaced by CRLF" for 8 of
+# the 9 files. A later checkout would rewrite them, and scripts/sync-install.mjs --check compares
+# BYTES -- a CRLF rewrite would report STALE and trigger a real write for a fake reason.
+* text=auto eol=lf

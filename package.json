@@ -1,0 +1,28 @@
+{
+  "name": "dsh-preset-local-delegate",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "DSH agent preset: the shipped `standard` preset verbatim, plus gated delegation to a local tool model.",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node local-delegate.selftest.mjs",
+    "trace": "node scripts/subagent-trace.mjs",
+    "sync": "node scripts/sync-install.mjs",
+    "sync:check": "node scripts/sync-install.mjs --check"
+  },
+  "exports": {
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./local-delegate.mjs": "./local-delegate.mjs"
+  },
+  "files": [
+    "cordis.patch.yml",
+    "*.mjs",
+    "README.md",
+    "scripts/"
+  ]
+}
