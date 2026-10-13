@@ -10,7 +10,7 @@
 
 ## 一、它解决什么问题
 
-本地引擎（本机 Strata，`qwen3.8-flash-next-coder-iq1_m`）免费但**不可靠**：同一个 prompt 发三次可能两次对、一次烧满 120 秒预算。API token 贵但可靠。
+本地引擎（本机 Strata，`qwen3.8-flash-next-iq2_xs`）免费但**不可靠**：同一个 prompt 发三次可能两次对、一次烧满 120 秒预算。API token 贵但可靠。
 
 于是关键判断不是"这个任务看起来简单吗"，而是：
 

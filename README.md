@@ -261,7 +261,7 @@ http(s) URL, or a bare local path), and the engine advertises it:
 
 ```
 GET /v1/models → architecture.input_modalities = ["text", "image"]
-GET /health    → {"status":"ok","model":"qwen3.8-flash-next-coder-iq1_m","images":true,"loaded":true}
+GET /health    → {"status":"ok","model":"qwen3.8-flash-next-iq2_xs","images":true,"loaded":true}
 ```
 
 So the capability was always there — the delegation layer just had no way to carry a picture.
@@ -325,7 +325,7 @@ base64 string, which is why 190 green assertions coexisted with a feature that n
 assertions now require bytes and cite the declaration above (mutation-checked: reverting to base64
 fails exactly those two).
 
-### Measured cost of an image (this engine, thinking off, temperature 0)
+### Measured cost of an image (this engine, measured at `reasoning_effort: none` on the coder model, temperature 0)
 
 | image | image tokens | first-visit wall | repeat of the same image |
 |---|---:|---:|---:|
@@ -408,7 +408,7 @@ generated tokens means **the thinking channel is on by default**.
 `delegate_batch` therefore sends:
 
 ```js
-{ agentOptions: { provider: 'strata', model: 'qwen3.8-flash-next-coder-iq1_m', maxTokens: 4096 },
+{ agentOptions: { provider: 'strata', model: 'qwen3.8-flash-next-iq2_xs', maxTokens: 4096 },
   toolFilter: { allow: [] },          // the local model has no tool loop: schemas are pure overhead
   persona: '<a two-line tool-model persona>' }
 ```
@@ -429,15 +429,34 @@ generated tokens means **the thinking channel is on by default**.
 | an absent `temperature` keeps the engine's default, **which is greedy (0)** | `serve/server.py:161-162` |
 | greedy measured 6/6 on the tool-task set; `temperature 0.6` measured 5/6 | `本地工具模型建议.md` §3.1 |
 | the engine accepts exactly `reasoning_effort: none \| low \| medium \| high` | `serve/server.py:1764-1766` |
-| thinking off measured 5/5 on extraction/counting/arithmetic/code at a 0.61 s median; on, a 3.48 s median and a 12.42 s worst case, with no correctness gain on those classes | `本地工具模型建议.md` §3.2 |
+| thinking off measured 5/5 on extraction/counting/arithmetic/code at a 0.61 s median; on, a 3.48 s median and a 12.42 s worst case, with no correctness gain on those classes. **Caveat added 2026-10-13:** those classes were not multi-step arithmetic, where `none` is silently wrong (see *Thinking now runs at `low`* below) | `本地工具模型建议.md` §3.2 |
 
 So **do not add a `sampling` block to the engine config** — the delegation path is already on the
 6/6 configuration. Temperature was never the problem.
 
-**Thinking is now off at the engine for this deployment** (`POST /settings {"defaults":
-{"reasoning_effort":"none"}}`, persisted to `strata-coder-iq1_m.shared-settings.json`), because the
+**Thinking now runs at `low` at the engine for this deployment** (`POST /settings {"defaults":
+{"reasoning_effort":"low"}}`, persisted to `strata-iq2_xs.shared-settings.json`), because the
 engine's shared defaults fill in only where a request carries none of its own (`serve/server.py:759`)
-and the harness sends none. Measured on this machine, 2026-10-01:
+and the harness sends none. This replaced an earlier `none`. Measured on this machine, 2026-10-13,
+on the model this deployment now runs (`qwen3.8-flash-next-iq2_xs`):
+
+| measurement | at `none` | at `low` |
+|---|---|---|
+| a 3-step percentage question ("120 items, sell 1/3, then sell 1/4 of what is left, add 60") | **100 — wrong** | **120 — right** |
+| generated tokens / wall time on that task | 4 tok / 0.4 s | 104 tok / 1.0 s |
+| `low` vs `medium` vs `high`, latency and correctness | — | indistinguishable from each other |
+
+The reason is correctness, not speed: at `none` the model answers multi-step arithmetic **silently
+wrong** (`100` where `120` is right, with no sign of doubt), while simple work — extraction, JSON,
+runnable code, reading an image — passes in every mode. So `low` costs about **+0.7 s** and ~100
+tokens per call and only pays off on multi-step reasoning. A caller that wants the old speed back can
+send `reasoning_effort: none` on the request itself, or set `DSH_LOCAL_REASONING_EFFORT`
+(see *Configuration*). Note that `"Please calculate step by step"` also rescues `none` on such a
+task, but costs *more* than `low` does (170 tokens vs 104), so it is not worth doing by hand.
+
+The tables below are **historic**: they were measured on the **coder** model at `reasoning_effort:
+none` on 2026-10-01, before this deployment moved to `iq2_xs` at `low`. They are kept because the
+`none`-versus-on comparison is what the change above was originally based on.
 
 | measurement | before | after |
 |---|---|---|
@@ -463,25 +482,25 @@ guidance says so explicitly.
 
 | fact | how |
 |---|---|
-| `strata/qwen3.8-flash-next-coder-iq1_m` is a live route | `list_subagent_models provider=strata` |
+| `strata/qwen3.8-flash-next-iq2_xs` is a live route | `list_subagent_models provider=strata` |
 | a delegated task round-trips correctly | sent a 3-line extraction; got `["alpha","delta","zeta"]` |
 | **no reasoning effort may be sent** — the provider rejects one it does not advertise | `subagent(provider=strata, reasoning_effort='none')` → `provider "strata" model "…" does not support reasoning effort "none"`, before any request is sent |
-| the engine is up and greedy | `GET /health` → `{"status":"ok","model":"qwen3.8-flash-next-coder-iq1_m","loaded":true}` |
+| the engine is up and greedy | `GET /health` → `{"status":"ok","model":"qwen3.8-flash-next-iq2_xs","loaded":true}` |
 | the attachment store takes encoded **bytes**, not base64 | in `app.asar`: `SaveImageAttachment { data: Uint8Array; … }`, `probeImage` → `sharp(data)`, and the wire adapter `saveInput` does `decodeBase64(image.data)` |
 | a preset module instance is loaded **once per DSH process** | DSH started `18:12:02`, the module was rewritten `18:16:32`, a session opened `18:26` still reported the old `retries` default (`attempts=2`); see *Installing and editing* |
 | what a delegated child can actually reach | its own transcript: `list_subagent_models` works, `subagent` exists but is always refused (`depth 2 exceeds maxDepth 1`), `workflow` is `unknown tool` (3 attempts, nothing written) |
 
 Because of that rejection, `DSH_LOCAL_REASONING_EFFORT` defaults to **empty**: the request omits
-the field rather than failing. Two ways to run with thinking off, in order of preference:
+the field rather than failing, so the engine's shared default decides the effort. Two ways to set that default, in order of preference:
 
 1. **At the engine, for every client.** The engine keeps its shared sampling defaults in
    `<config>.shared-settings.json` and applies them to any request that does not carry its own:
    ```powershell
    Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8080/settings `
-     -ContentType 'application/json' -Body '{"defaults":{"reasoning_effort":"none"}}'
+     -ContentType 'application/json' -Body '{"defaults":{"reasoning_effort":"low"}}'
    ```
 2. **Per call, from the harness.** Declare the effort on the provider's model row in the profile
-   patch so the provider advertises it, then set `DSH_LOCAL_REASONING_EFFORT=off`:
+   patch so the provider advertises it, then set `DSH_LOCAL_REASONING_EFFORT=low` (map `off` to `none` if you want the old speed back):
    ```yaml
    - id: llm-pi-ai
      name: "@deepseek-ai/dsh-llm-pi-ai"
@@ -489,7 +508,7 @@ the field rather than failing. Two ways to run with thinking off, in order of pr
        providers:
          strata:
            models:
-             - id: qwen3.8-flash-next-coder-iq1_m
+             - id: qwen3.8-flash-next-iq2_xs
                reasoningEfforts:
                  off: none
                  low: low
@@ -501,7 +520,7 @@ the field rather than failing. Two ways to run with thinking off, in order of pr
 | Variable | Default | Effect |
 |---|---|---|
 | `DSH_LOCAL_PROVIDER` | `strata` | provider route for the delegated child |
-| `DSH_LOCAL_MODEL` | `qwen3.8-flash-next-coder-iq1_m` | model id |
+| `DSH_LOCAL_MODEL` | `qwen3.8-flash-next-iq2_xs` | model id |
 | `DSH_LOCAL_REASONING_EFFORT` | *(empty)* | per-call effort; empty omits the field (see above) |
 | `DSH_LOCAL_STRIP_TOOLS` | `1` | `0` keeps the child's inherited tool surface |
 | `DSH_LOCAL_CHILD_PERSONA` | a two-line tool-model persona | shadows the child's `deployment:persona-prefix` |
@@ -819,7 +838,7 @@ These are stated rather than hidden, in the same spirit as the measurements abov
   turn, and walked the entire `reasoning_effort` ladder (`medium` ×40, `low`/`none`/`minimal` ×21
   each, `high`/`xhigh`/`max` ×20 each) chasing an error it could not escape: this engine advertises
   **no** reasoning effort, so every attempt returned
-  `provider "strata" model "qwen3.8-flash-next-coder-iq1_m" does not support reasoning effort "X"`.
+  `provider "strata" model "qwen3.8-flash-next-iq2_xs" does not support reasoning effort "X"`.
   The child's own transcript records the shape exactly — 173 `step/start`, 173 `step/end`, 172
   `assistant/message`, 172 `tool/call`, 172 `tool/result`, **169 of the results errors** — spanning
   **341 s** and **24,500 output tokens**, with its prompt growing ~193 tokens per step from 1,970 to
