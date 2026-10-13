@@ -21,7 +21,7 @@ import { homedir } from 'node:os'
 const HERE = dirname(fileURLToPath(import.meta.url))
 const SRC = resolve(HERE, '..')
 const PKG = 'dsh-preset-local-delegate'
-const FILES = ['package.json', 'cordis.patch.yml', 'local-delegate.mjs', 'local-delegate.selftest.mjs', 'README.md']
+const FILES = ['package.json', 'cordis.patch.yml', 'local-delegate.mjs', 'local-delegate.selftest.mjs', 'README.md', 'README.en.md']
 
 /** The pnpm copy to write. `DSH_PROFILE_DIR` is set for an agent's shell by the harness. */
 function targetDir() {

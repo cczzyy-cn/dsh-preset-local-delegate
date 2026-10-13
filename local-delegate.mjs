@@ -14,7 +14,8 @@
  * compute AND a DeepSeek round trip, i.e. more than never delegating. So the entry condition
  * for this path is "I can write the checker", not "this looks easy".
  *
- * MEASURED FACTS THIS MODULE IS BUILT ON (see README.md for the table and the sources):
+ * MEASURED FACTS THIS MODULE IS BUILT ON (see README.en.md for the table and the sources;
+ * README.md is the Chinese main document):
  *   - the engine's own sampling default is GREEDY, which is the 6/6 configuration;
  *   - the thinking channel is ON by default and buys nothing on these task classes;
  *   - the child's inherited tool schemas are most of its prompt (measured 12,401 tokens for a
@@ -86,7 +87,7 @@ const LOCAL_MODEL = process.env.DSH_LOCAL_MODEL || 'qwen3.8-flash-next-iq2_xs'
  * for one is rejected before the request is sent —
  *   provider "strata" model "qwen3.8-flash-next-iq2_xs" does not support reasoning effort "none"
  * (measured 2026-10-01 against the live harness). To delegate with thinking OFF, either declare
- * the effort in the provider config or set the engine's shared default; README.md has both.
+ * the effort in the provider config or set the engine's shared default; README.en.md has both.
  */
 const REASONING_EFFORT = process.env.DSH_LOCAL_REASONING_EFFORT || ''
 
@@ -175,9 +176,31 @@ const MAX_TOKENS = Number(process.env.DSH_LOCAL_MAX_TOKENS || 4096)
  *
  * Read per call rather than at module load, so the self-test can drive it without a second process.
  */
-function childBudgetMs() {
-  const raw = Number(process.env.DSH_DELEGATE_TIMEOUT_MS || 120000)
+function childBudgetMs(override) {
+  const raw = Number(override ?? process.env.DSH_DELEGATE_TIMEOUT_MS ?? 120000)
   return Number.isFinite(raw) && raw > 0 ? raw : 120000
+}
+
+/**
+ * Cap on the TOTAL characters one task's `files:` may inline into the child prompt.
+ *
+ * This exists because the alternative to `files:` is the caller pasting the same text into `prompt`,
+ * and then the caller pays for those bytes in its OWN context as well. `files:` moves the whole cost
+ * to the free side, but it also removes the only thing that used to bound the prompt: a caller that
+ * pasted 400 KB felt it in its own context first. So the bound is explicit here.
+ *
+ * 200,000 characters is deliberate, not arbitrary. At the 2.78 chars/token this deployment measured
+ * on real TypeScript/JSON, that is ~72K tokens — inside the <= 142K token RELIABLE window (past
+ * ~145K the model silently stops following the instruction) and far inside the 253,952-token hard
+ * ceiling (`max_context 262144 - maxTokens 8192`). Raising it is allowed; raising it past the
+ * reliable window is not a bigger context, it is a quieter wrong answer.
+ */
+const FILE_CHARS_DEFAULT = 200000
+
+/** Read per call, like `childBudgetMs`, so the self-test can drive the cap in-process. */
+function fileChars() {
+  const raw = Number(process.env.DSH_DELEGATE_FILE_CHARS || FILE_CHARS_DEFAULT)
+  return Number.isFinite(raw) && raw > 0 ? raw : FILE_CHARS_DEFAULT
 }
 
 /** Bounded slice of a raw answer that per-task results carry back to the caller. */
@@ -210,7 +233,7 @@ export const VERIFIER_KINDS = [
   { id: 'contains', summary: 'literal substring' },
   { id: 'all_of', summary: 'every needle in `expected` (array, or "a|b") appears, case- and punctuation-insensitive' },
   { id: 'compile', summary: 'the answer parses as JavaScript' },
-  { id: 'python_exec', summary: 'extracts a `def` block and runs it with your `assert` expressions' },
+  { id: 'python_exec', summary: 'extracts a `def` block and runs it with your `assert` expressions (a leading `assert` in an entry is tolerated)' },
   { id: 'covers', summary: 'every needle appears (optionally only in `field`) — judged on what the answer OMITS, so the needles may be machine-derived' },
   { id: 'subset_of', summary: 'nothing outside the allowed set `expected`: an invented element FAILS, a missing one does not' },
   { id: 'union_eq', summary: "the answer's groups cover `expected` exactly — a partition is validated from the universe alone" },
@@ -237,18 +260,27 @@ const GUIDE =
   + '`citation` (the claim is never judged, only its evidence: every claim carries {file,line,quote} and the quote must really occur at that line — this is how a summary or a code review becomes gateable), '
   + 'and `python_check` (an arbitrary Python invariant; the answer arrives as `answer`). Reach for these FIRST: they remove the old precondition of computing the answer before delegating.\n'
   + '- PROVE THE GATE BEFORE SPENDING THE DELEGATION. Pass `prove: true` (or `prove: {positive, semantics, ...}`) on a task and the plugin mutates a known-good answer and requires the verifier to reject every mutant, '
-  + 'AND to accept the known-good answer itself — a gate that rejects everything is as powerless as one that accepts everything, and is refused the same way. `prove: true` derives the positive example from `expected` for most kinds; `python_exec`/`python_check`/`regex`/`citation` need `prove.positive` from you. '
+  + 'AND to accept the known-good answer itself — a gate that rejects everything is as powerless as one that accepts everything, and is refused the same way. `prove: true` derives the positive example from `expected` for most kinds. DO NOT pass `prove` on `python_exec`/`python_check`/`regex`/`citation`: those four have no structural mutant operator, so `prove` can never certify them, and passing it REFUSES the task instead of spending it (measured 2026-10-13) — a `prove.positive` from you does not change that, it only gets the positive half checked. Gate those four by hand. '
   + 'A gate with no discriminating power is reported instead of being used, so a decorative verifier costs nothing. Switch on a `semantics` flag only when the mutant really is wrong — a false alarm condemns a gate that is fine.\n'
   + '- READ THE WHOLE ANSWER. A task verdict that PASSes carries only a short `raw` echo; when the answer is longer, the plugin WRITES the full answer to disk and returns `outputFile` (with bytes and sha256). Read that file instead of re-running the task — a delegated child has no tools, so it cannot write the file itself.\n'
   + '- WHEN THE LOCAL MODEL NEEDS TOOLS, CALL `subagent` INSTEAD OF `delegate_batch`. `delegate_batch` strips every tool on purpose (measured: a 13,023-token prompt with the inherited schemas and a 5,606 ms cold prefill, versus 2,780 tokens stripped), because its shapes are text in / text out. '
   + 'But a delegated child DOES inherit tools — the harness supplies the loop — measured on `strata/qwen3.8-flash-next-iq2_xs`: a child used `read` and answered from the file, and used `glob` then `read_image` to read a picture correctly, both for 0 API tokens. '
-  + 'So for "open these files" or "read this screenshot", call `subagent(provider="strata", model="qwen3.8-flash-next-iq2_xs")`: ~5.6 s for the first step, then ~1 s per step through the prefix cache. It carries NO verifier, so gate the answer with `verify_task` yourself before using it.\n'
+  + 'So for "open these files" or "read this screenshot", call `subagent(provider="strata", model="qwen3.8-flash-next-iq2_xs")`: ~5.6 s for the first step, then ~1 s per step through the prefix cache. It carries NO verifier, so gate the answer with `verify_task` yourself before using it. '
+  + 'MEASURED SHAPE COST: the fixed prompt prefix is ~2.4K tokens for `delegate_batch` versus ~15.3K for a tool-using `subagent` (the tool schemas). A `subagent` answer must be handed BACK into `verify_task` to be gated, so it crosses your context twice — ask for compact answers, or have the child write the answer to a file and pass `contentFile` so it never has to be pasted back at all. A `delegate_batch` child cannot open anything: put the text in `prompt`, or name the paths in `files: [..]` and the plugin inlines their contents for you — NEVER paste a file into `prompt` yourself, because you pay for those bytes in your own context as well, which is the whole cost this exists to avoid. Every batch reports the local tokens it actually spent (prompt / read / reused / generated), read from the engine: that is the receipt for "0 API tokens".\n'
   + '- `subagent` DEFAULTS TO BACKGROUND (`run_in_background: true`): it then returns an id immediately, NOT the answer, and the result arrives later as a separate message. Do NOT poll `job_output` or `job_list` with that id — background jobs are a different mechanism and report `unknown job`. '
   + 'Pass `run_in_background: false` to block and get the result in the tool result instead. A delegated child never sees this guide, so if you delegate a task that itself calls `subagent`, put "pass run_in_background: false" in that task prompt. '
   + 'Measured: the same nested call left unset returned an id and the child burned two steps on `job_output` then `job_list`; with `run_in_background: false` it returned the answer directly.\n'
   + '- RED LINE on the tool-using path: delegate STEPS a machine can check (reading files, reading a screenshot, a reading-shaped answer), never a SEQUENCE OF ACTIONS. A click has no deterministic judge — a wrong click is silent, and no verifier can tell it from a right one. Perception can be delegated; agency cannot.\n'
+  + '- LEADER MODE — you DECIDE, DIRECT and MONITOR; you do not do the reading yourself. The loop: '
+  + '(1) split the work into steps that each end in ONE machine-checkable conclusion; '
+  + '(2) write that checker BEFORE dispatching (writing it is how you show you understood the step — and if it costs more than doing the step, just do the step); '
+  + '(3) dispatch: `delegate_batch` for text in / text out, `subagent` for a step that must open files or read a picture; '
+  + '(4) read the VERDICT AND THE PAYLOAD, because a PASS only covers what your checker asked; '
+  + '(5) on FAIL change something — split it, re-ask, or do that step yourself. '
+  + '`citation` is how you verify a READING YOU NEVER DID: have the child return {file,line,quote} and the gate proves the quotation is real at that line — but it judges the EVIDENCE, not the inference, so "grounded" is not "true". '
+  + 'Three things stay yours: the checker, anything causal across files or needing multi-step reasoning, and the words the user reads.\n'
   + '- For a LARGE job, plan on DeepSeek first, batch the mechanical parts to local (extraction, transforms, dedupe, formatting, per-item summaries, candidate scoring), '
-  + 'then SYNTHESIZE on DeepSeek. DeepSeek keeps multi-step reasoning, anything causal across files, and every word the user reads.\n'
+  + 'then synthesize on DeepSeek.\n'
   + '- Give the local model the INPUT INLINE, never "go read the file": it has no tools. Keep each task under ~40 input rows / ~4K chars and split anything larger — '
   + 'a 47-row extraction task degenerated into a verbatim loop here, and the same input split in two passed first try.\n'
   + '- CAPACITY IS NOT ADVERTISED — QUERY IT, DO NOT GUESS. `list_subagent_models` returns only a name and the advertised reasoning efforts: no context window, no output cap, no modalities. '
@@ -507,8 +539,118 @@ export function inspectImages(images) {
 }
 
 /**
- * Write a delegated answer to disk, verbatim, and describe it.
+ * Read text files into the child prompt, the same way `inspectImages` reads pictures.
  *
+ * WHY THIS EXISTS. `delegate_batch`'s child has no tools (that is the point — it is a text-in /
+ * text-out call), so "analyse this file" used to mean the CALLER pasting the file into `prompt`.
+ * The caller then pays for those bytes in its own context, permanently, and the whole saving that
+ * justifies delegating evaporates for exactly the task shape that needs it most. Measured
+ * 2026-10-13: a 132.8 KB analysis cost the caller ~1,850 tokens to dispatch and read back, of which
+ * the bulk was the caller's own re-pasting; the same job with `files:` costs the caller nothing.
+ *
+ * The second reason is a measured failure: told to "read these five files", a tool-less child
+ * answered `I cannot read files … I will not invent symbol names` and returned `[]` (the gate
+ * reported 41/41 missing). Correct behaviour, wasted call. A caller with nowhere to put a path
+ * inside the tool contract will keep trying to put one in the prompt.
+ *
+ * Pure and synchronous, like `inspectImages`, so a bad path is reported BEFORE the child runs and
+ * nothing half-formed is sent.
+ */
+export function inspectFiles(files) {
+  const list = Array.isArray(files) ? files : (files == null || files === '' ? [] : [files])
+  const out = []
+  let total = 0
+  for (const p of list) {
+    const file = String(p)
+    let text
+    try {
+      text = readFileSync(file, 'utf8')
+    } catch (e) {
+      throw new Error(`files: cannot read ${JSON.stringify(file)} — ${String((e && e.message) || e)}`)
+    }
+    total += text.length
+    if (total > fileChars()) {
+      throw new Error(
+        `files: these ${list.length} file(s) exceed DSH_DELEGATE_FILE_CHARS (${fileChars()} characters in total) `
+        + '— split the task, or raise that value. The engine refuses a prompt whose size plus maxTokens passes its '
+        + 'max_context, and the RELIABLE window is much smaller than the advertised one (measured <= 142K tokens; '
+        + 'past ~145K the model silently stops following the instruction rather than saying so).',
+      )
+    }
+    out.push({ path: file, name: basename(file), chars: text.length, text })
+  }
+  return out
+}
+
+/** One inlined file as a delimited block, so the model can tell several files apart. */
+export function fileBlock(f) {
+  return `\n\n<<< file: ${f.path} (${f.chars} chars) >>>\n${f.text}\n<<< end file: ${f.path} >>>`
+}
+
+/**
+ * The engine's own token totals, so a delegation can report what it actually cost.
+ *
+ * Why read them instead of counting: `SubagentResult` (declared in the running build) carries only
+ * `output`/`structured`/`diagnostic`/`stopReason` — there is NO usage field, so the plugin cannot
+ * learn the token cost from the result. The engine's `/metrics` publishes `totals` (cumulative
+ * requests / prompt_tokens / reused / output_tokens), and a before/after pair around one task is the
+ * cost of that task. Measured 2026-10-13: this is exactly the arithmetic a human had to do by hand
+ * twice from the engine log to answer "how many tokens actually went to the subagent?".
+ *
+ * Deliberately forgiving: `/metrics` is the engine's own undocumented endpoint, so a missing or
+ * slow engine must degrade to "no ledger" rather than fail a delegation. `setEngineTotalsReader` is
+ * the test seam (the self-test must not depend on a live engine).
+ */
+async function defaultEngineTotalsReader() {
+  try {
+    const res = await fetch(`http://${ENGINE_HOST}:${ENGINE_PORT}/metrics`, { signal: AbortSignal.timeout(400) })
+    if (!res.ok) return null
+    const body = await res.json()
+    const t = body?.totals
+    if (!t || !Number.isFinite(Number(t.prompt_tokens))) return null
+    return {
+      prompt: Number(t.prompt_tokens) || 0,
+      reused: Number(t.reused) || 0,
+      generated: Number(t.output_tokens) || 0,
+    }
+  } catch { return null }
+}
+
+let engineTotalsReader = defaultEngineTotalsReader
+
+/** Replace the totals reader (self-test seam). Pass nothing to restore the default. */
+export function setEngineTotalsReader(fn) {
+  engineTotalsReader = typeof fn === 'function' ? fn : defaultEngineTotalsReader
+}
+
+/** Never throws: an unavailable ledger is `null`, not a failed task. */
+export async function readEngineTotals() {
+  try { return await engineTotalsReader() } catch { return null }
+}
+
+/**
+ * The local token cost between two totals readings, or null when it cannot be attributed.
+ *
+ * A DECREASE is not a small number, it is a different engine: the counters are cumulative since
+ * engine start, so a restart mid-task makes the difference meaningless. Reporting null is the
+ * honest outcome; reporting a negative or wrapped cost would be worse than reporting none.
+ */
+export function tokenDelta(before, after) {
+  if (!before || !after) return null
+  const prompt = after.prompt - before.prompt
+  const reused = after.reused - before.reused
+  const generated = after.generated - before.generated
+  if (prompt < 0 || reused < 0 || generated < 0) return null
+  return { prompt, reused, generated, read: Math.max(0, prompt - reused) }
+}
+
+/** `1234567` -> `1,234,567`, so a ledger line stays readable at a glance. */
+function grouped(n) {
+  return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+}
+
+/**
+ * Write a delegated answer to disk, verbatim, and describe it.
  * The id is slugged into the filename so a batch is readable by eye, and truncated so a long
  * description cannot exceed the path limit. Nothing is deleted afterwards: the file IS the
  * deliverable the caller reads, and a retry overwrites its own file rather than adding another.
@@ -693,7 +835,14 @@ function checkInner(kind, content, expected, field, asserts) {
       const dir = mkdtempSync(join(tmpdir(), 'local-delegate-verify-'))
       const f = join(dir, 'probe.py')
       try {
-        writeFileSync(f, code + '\n' + asrt.map((a) => `assert (${a})`).join('\n'), 'utf8')
+        // `asserts` are EXPRESSIONS, wrapped here into `assert (...)`. A caller who writes the whole
+        // STATEMENT (`"assert is_prime(2) is True"`) used to get `assert (assert is_prime(2) is True)`
+        // — a SyntaxError inside generated code, which the FAIL reports as if the model's code were
+        // broken and blames the wrong half (hit for real 2026-10-13; cost one delegation). `assert`
+        // is a Python keyword, so no legitimate expression starts with it: strip the keyword and both
+        // spellings work.
+        const expr = (a) => String(a).trim().replace(/^assert\s+/, '')
+        writeFileSync(f, code + '\n' + asrt.map((a) => `assert (${expr(a)})`).join('\n'), 'utf8')
         execFileSync(VERIFY_PYTHON, [f], { stdio: 'pipe' })
         return { ok: true, detail: 'python-exec ok' }
       } catch (e) { return { ok: false, detail: String((e && e.message) || e) } }
@@ -1200,9 +1349,21 @@ export function proofWhy(proof, positiveSource) {
     // Telling the caller "nothing to break" for a kind that can NEVER be broken automatically sends it
     // hunting for a bug that is not there. Name those kinds (single source: UNSTRUCTURED_KINDS).
     if (UNSTRUCTURED_KINDS.includes(proof.kind)) {
+      // Two different situations used to collapse into one sentence, and the difference IS the
+      // caller's next move. With a positive the caller SUPPLIED and this gate ACCEPTED, "its positive
+      // example cannot be derived" is simply false — measured 2026-10-13: `regex` with a correct
+      // prove.positive still got that sentence, and nothing said the task had never been run. The
+      // GUIDE told callers to pass `prove.positive` for exactly these four kinds, so that wording
+      // turned a correct call into a dead end.
+      if (positiveSource === 'caller') {
+        return `\`${proof.kind}\` has no structural mutant operator, so \`prove\` cannot certify it even though your `
+          + 'positive example was ACCEPTED — that is expected, not a defect, and the task is refused rather than '
+          + 'spent. Drop `prove` for this kind (the gate then runs unproven), or check both halves by hand: it must '
+          + 'PASS a known-good answer and REJECT a deliberately wrong one.'
+      }
       return `\`${proof.kind}\` has no structural mutant operator and its positive example cannot be derived, so `
-        + '`prove` can never certify it — that is expected, not a defect. Check it by hand instead: the gate must '
-        + 'PASS a known-good answer and REJECT a deliberately wrong one.'
+        + '`prove` can never certify it — that is expected, not a defect. Drop `prove` for this kind, or check both '
+        + 'halves by hand: the gate must PASS a known-good answer and REJECT a deliberately wrong one.'
     }
     return 'the mutator found nothing to break, so nothing was proven'
   }
@@ -1292,8 +1453,17 @@ export async function buildChildRequest(opts) {
     imageError = String((e && e.message) || e)
   }
   // `o.prompt` is the historical string form, kept because the self-test and any external caller
-  // pin it; `o.text` is the same thing under the name the content block uses.
-  const text = String(o.text ?? o.prompt ?? '')
+  // pin it; `o.text` is the same thing under the name the content block uses. `files` are inlined
+  // into that same text block: they are text, they belong with the instruction, and a separate block
+  // shape would hit the adapter's silent `default: break` (the trap `inspectImages` documents).
+  let fileError = ''
+  let fileText = ''
+  try {
+    fileText = inspectFiles(o.files).map(fileBlock).join('')
+  } catch (e) {
+    fileError = String((e && e.message) || e)
+  }
+  const text = String(o.text ?? o.prompt ?? '') + fileText
   return {
     label: o.label,
     parent: o.parent,
@@ -1308,16 +1478,18 @@ export async function buildChildRequest(opts) {
     ...(o.persona ? { persona: o.persona } : {}),
     signal: o.signal,
     ...(imageError ? { imageError } : {}),
+    ...(fileError ? { fileError } : {}),
   }
 }
 
 /** The request this preset actually sends, from the resolved module configuration. */
-export function childRequest(exec, id, prompt, images, attachments, signal) {
+export function childRequest(exec, id, prompt, images, attachments, signal, files) {
   return buildChildRequest({
     label: id,
     parent: exec?.agent,
     prompt,
     images,
+    files,
     attachments,
     // The caller's signal by default; `delegate_batch` passes this attempt's budget-combined signal.
     signal: signal ?? exec?.signal,
@@ -1393,9 +1565,17 @@ export function apply(ctx) {
       properties: {
         kind: { type: 'string', enum: VERIFIER_KIND_IDS, description: `one of: ${KIND_LINE}` },
         content: { type: 'string', description: 'the result text to check' },
+        contentFile: {
+          type: 'string',
+          description:
+            'read the content to verify from this file instead of `content` (absolute path, or relative to the '
+            + "caller's cwd). Used on the tool-using path: a `subagent` carries no verifier, so its answer must be "
+            + 'gated here — and pasting that answer into `content` puts it through your context a SECOND time. Have '
+            + 'the child write its answer to a file and pass the path instead. Capped by DSH_DELEGATE_FILE_CHARS.',
+        },
         expected: { type: 'string', description: 'expected value (json/string/number/regex/schema) as needed' },
         field: { type: 'string', description: 'for json_order: the field name to order by; for covers: the field the needles must appear in' },
-        asserts: { type: 'array', items: { type: 'string' }, description: 'for python_exec: assertion expressions to append' },
+        asserts: { type: 'array', items: { type: 'string' }, description: 'for python_exec: assertion expressions to append; each is wrapped in `assert (...)`, and a leading `assert` is tolerated' },
         prove: {
           type: 'object',
           additionalProperties: true,
@@ -1415,6 +1595,24 @@ export function apply(ctx) {
     timeoutMs: 30000,
     execute: async (args) => {
       const kind = String(args.kind)
+      // `contentFile` is the anti-echo path: the answer never has to be pasted back through the
+      // caller's context just to be judged. Read it here, and refuse an oversized one for the same
+      // reason `files:` has a cap.
+      let content = args.content
+      if (typeof args.contentFile === 'string' && args.contentFile !== '') {
+        try {
+          content = readFileSync(args.contentFile, 'utf8')
+        } catch (e) {
+          return { ok: false, detail: `contentFile: cannot read ${JSON.stringify(args.contentFile)} — ${String((e && e.message) || e)}` }
+        }
+        if (content.length > fileChars()) {
+          return {
+            ok: false,
+            detail: `contentFile: ${content.length} characters exceeds DSH_DELEGATE_FILE_CHARS (${fileChars()}) — `
+              + 'verify a bounded extract, or raise that value',
+          }
+        }
+      }
       if (args.prove && typeof args.prove === 'object') {
         const fromCaller = args.prove.positive !== undefined
         const positive = fromCaller
@@ -1432,7 +1630,7 @@ export function apply(ctx) {
         })
         if (!proof.proven) return { ok: false, detail: `prove: gate has no power — ${proofWhy(proof, fromCaller ? 'caller' : 'derived')}` }
       }
-      return check(kind, args.content, args.expected, args.field, args.asserts)
+      return check(kind, content, args.expected, args.field, args.asserts)
     },
   })
 
@@ -1440,15 +1638,20 @@ export function apply(ctx) {
     name: 'delegate_batch',
     description:
       'Delegate self-contained, deterministic-verifiable subtasks to the LOCAL model (0 API tokens) and verify each one. '
-      + 'Each task: {description, prompt, images?, prove?, verify?{kind,expected,field,asserts}}. Returns per-task {id, ok, detail, output, attempts}. '
+      + 'Each task: {description, prompt, files?, images?, timeoutMs?, prove?, verify?{kind,expected,field,asserts}}. Returns per-task {id, ok, detail, output, attempts}. '
       + 'Runs sequentially on one local engine. Keep the mechanical parts here and the synthesis on DeepSeek. '
       + `verify.kind is one of: ${KIND_LINE}. `
       + 'For a PASS whose answer is longer than the echoed slice, the FULL answer is written to `outputFile` (with bytes '
       + 'and sha256): read that file instead of redoing the work — a delegated child has no tools here, so it cannot write it itself. '
+      + 'A task with `files` (paths to text files) has THEIR CONTENT inlined into the child prompt by the plugin — the child '
+      + 'still has no tools, but the bytes never pass through the caller: use `files` instead of pasting a file into `prompt`, '
+      + 'which the caller would pay for twice. Capped by DSH_DELEGATE_FILE_CHARS, and a bad path is a per-task FAIL. '
       + 'A task with `images` (absolute paths to png/jpg/jpeg/webp/gif) sends that picture to the local engine, which is '
       + 'multimodal: use it for OCR, screenshot reading and "what shape/number/colour" questions. The file is read and '
       + 'registered as a harness attachment by the CALLER, so a relative path means what the caller\'s cwd says. The local '
-      + 'engine reads images only — it cannot draw, and it cannot see a file it was not handed.',
+      + 'engine reads images only — it cannot draw, and it cannot see a file it was not handed. '
+      + 'Every batch reports the LOCAL TOKENS it actually spent (prompt / freshly prefilled / generated), read from the '
+      + 'engine\'s own /metrics, plus the wall time: 0 API tokens is the claim, and this is the receipt.',
     parameters: {
       type: 'object',
       properties: {
@@ -1459,6 +1662,12 @@ export function apply(ctx) {
             properties: {
               description: { type: 'string' },
               prompt: { type: 'string' },
+              files: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'paths to TEXT files whose CONTENTS the plugin inlines into this child prompt (a relative path means what the caller\'s cwd says). Use this instead of pasting a file into `prompt`: the child still cannot open anything, but the bytes stay out of the caller\'s context. Total cap: DSH_DELEGATE_FILE_CHARS.',
+              },
+              timeoutMs: { type: 'integer', description: 'wall-clock budget for this task only, overriding DSH_DELEGATE_TIMEOUT_MS (default 120000). A budget overrun is not retried.' },
               images: {
                 type: 'array',
                 items: { type: 'string' },
@@ -1482,7 +1691,7 @@ export function apply(ctx) {
                   kind: { type: 'string', enum: VERIFIER_KIND_IDS, description: `one of: ${KIND_LINE}` },
                   expected: { type: 'string', description: 'expected value (json/string/number/regex/schema/config) as needed' },
                   field: { type: 'string', description: 'for json_order: the field to order by; for covers: the field the needles must appear in' },
-                  asserts: { type: 'array', items: { type: 'string' }, description: 'for python_exec: assertion expressions to append' },
+                  asserts: { type: 'array', items: { type: 'string' }, description: 'for python_exec: assertion expressions to append; each is wrapped in `assert (...)`, and a leading `assert` is tolerated' },
                 },
               },
             },
@@ -1509,6 +1718,7 @@ export function apply(ctx) {
           const facts = [
             r.attempts > 1 ? `attempts=${r.attempts}` : '',
             Number.isFinite(r.ms) ? `${r.ms} ms` : '',
+            r.tokens ? `${grouped(r.tokens.prompt)}+${grouped(r.tokens.generated)} tok` : '',
             r.stop && r.stop !== 'completed' && r.stop !== 'unknown' ? `stop=${r.stop}` : '',
           ].filter(Boolean).join(', ')
           const head = `${r.id}: ${r.ok === null ? 'NO_VERIFIER' : (r.ok ? 'PASS ✅' : 'FAIL ❌')} — ${r.detail || ''}${facts ? ` (${facts})` : ''}`
@@ -1535,8 +1745,22 @@ export function apply(ctx) {
         const passed = rows.filter((r) => r.ok === true).length
         const retried = rows.filter((r) => (r.attempts || 0) > 1).length
         const recovered = rows.filter((r) => (r.attempts || 0) > 1 && r.ok === true).length
+        // The receipt for "0 API tokens": what the local engine actually processed. Absent when the
+        // engine serves no /metrics, in which case the line simply does not appear — the footer must
+        // stay truthful rather than print a zero it cannot stand behind.
+        const tok = rows.reduce((a, r) => ({
+          prompt: a.prompt + (r.tokens?.prompt ?? 0),
+          read: a.read + (r.tokens?.read ?? 0),
+          reused: a.reused + (r.tokens?.reused ?? 0),
+          generated: a.generated + (r.tokens?.generated ?? 0),
+        }), { prompt: 0, read: 0, reused: 0, generated: 0 })
+        const tokenLine = (tok.prompt + tok.generated) > 0
+          ? ` · ${grouped(tok.prompt + tok.generated)} local tokens (${grouped(tok.prompt)} prompt: `
+            + `${grouped(tok.read)} read + ${grouped(tok.reused)} reused; ${grouped(tok.generated)} generated) · 0 API tokens`
+          : ''
         const footer = rows.length
           ? `— ${passed}/${rows.length} PASS · ${(totalMs / 1000).toFixed(1)} s of local compute`
+            + tokenLine
             + (retried ? ` · ${retried} retried, ${recovered} recovered` : '')
           : ''
         return [{ type: 'text', text: [...lines, footer].filter(Boolean).join('\n') }]
@@ -1579,6 +1803,12 @@ export function apply(ctx) {
         // Number the ids: a bare description collides when the same file is delegated twice.
         const id = `${index + 1}.${String(t.description || 'task')}`
         const images = Array.isArray(t.images) ? t.images : []
+        const files = Array.isArray(t.files) ? t.files : []
+        // One reading per TASK, taken before its first attempt: the counters are cumulative, so the
+        // pair around the attempts is this task's cost, retries included. Held across attempts so a
+        // retried task reports what it really spent rather than the last attempt alone (the same
+        // mistake the `ms`/`spentMs` split already fixed for wall time).
+        const totalsBefore = await readEngineTotals()
         let last = { id, ok: false, detail: 'not run', output: '', attempts: 0 }
         // Local compute this task has burned so far, across every attempt (see the footer note).
         let spentMs = 0
@@ -1625,7 +1855,7 @@ export function apply(ctx) {
           // ONE child run must not be able to hold the caller for as long as it likes. The budget
           // aborts the child AND unblocks this loop: see `childBudgetMs`. `budgetFired` is read
           // after the await, so the verdict can say *why* the run ended and refuse to retry it.
-          const budgetMs = childBudgetMs()
+          const budgetMs = childBudgetMs(t.timeoutMs)
           const budget = new AbortController()
           let budgetTimer
           let budgetFired = false
@@ -1633,11 +1863,17 @@ export function apply(ctx) {
             const attemptSignal = exec?.signal && typeof AbortSignal.any === 'function'
               ? AbortSignal.any([exec.signal, budget.signal])
               : budget.signal
-            const req = await childRequest(exec, id, String(t.prompt || ''), images, ctx.get('attachments'), attemptSignal)
+            const req = await childRequest(exec, id, String(t.prompt || ''), images, ctx.get('attachments'), attemptSignal, files)
             // A bad image path is the CALLER's mistake and cannot fix itself: report it as this
             // task's FAIL and move on, rather than letting it escape and take tasks 2..N with it.
             if (req.imageError) {
               last = { id, ok: false, detail: req.imageError, output: '', attempts: attempt, unretryable: true }
+              break
+            }
+            // Same contract for an unreadable or oversized `files` entry: the caller's mistake, this
+            // task's FAIL, and unretryable because re-reading the same path reproduces it exactly.
+            if (req.fileError) {
+              last = { id, ok: false, detail: req.fileError, output: '', attempts: attempt, unretryable: true }
               break
             }
             const run = await subagents.start(transport, req)
@@ -1751,6 +1987,11 @@ export function apply(ctx) {
           if (last.ok !== false || last.unretryable || attempt > retries || exec?.signal?.aborted) break
           await new Promise((resolve) => setTimeout(resolve, 250))
         }
+        // Attribute the local token cost to this task, once, after every attempt. `null` whenever the
+        // engine does not serve /metrics or restarted mid-task — an unattributable cost is reported as
+        // absent, never guessed.
+        const cost = tokenDelta(totalsBefore, await readEngineTotals())
+        if (cost) last.tokens = cost
         results.push(last)
       }
       return { results }

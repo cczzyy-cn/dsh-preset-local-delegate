@@ -1,5 +1,436 @@
 # 新会话交接单 — `local-delegate` 预设的收尾验证
-## 最新一轮（2026-10-13）：引擎/模型换代，以及两个真缺陷
+## 最新一轮（2026-10-13 二轮）：状态全绿，`subagent` 已恢复，并修好两个**误导性诊断**
+
+> **本节优先于下面所有记录（含上一轮那份 2026-10-13「引擎/模型换代」）。** 读这一节就能开工。
+
+### 0. 状态（逐项实测，与上一轮的表逐条对上）
+
+| 层 | 值 | 怎么确认 |
+|---|---|---|
+| 引擎 | `engine/BUILD.json` = **0.1.43.1**（`source: release`、cuda 13.0、vision gpu） | 直接读文件 |
+| Strata 源码 | `a0116b27` | `git -C <strata> log --oneline -1` |
+| 模型 | **qwen3.8-flash-next-iq2_xs**，`loaded: true`、`images: true` | `curl http://127.0.0.1:8080/health` |
+| 引擎窗口 | **262144** | 同上（`max_context`） |
+| 推理档位 | **`low`** —— 由多步算术答 `120` 反证（坑 B 的正解），不是读了配置就说 | 见 §5 |
+| DSH 路由 | `strata/qwen3.8-flash-next-iq2_xs`（`list_subagent_models` 只回名字，**不广告任何 reasoning effort**） | `list_subagent_models` |
+| preset | 源码 ⇄ 安装副本**逐字节一致**（新指纹见 §9），selftest **202 / 0**（见 §11、§12） | `node scripts/sync-install.mjs --check` |
+| **`subagent` 工具** | **可用**（上一轮那条未决项已关闭） | 见 §2 |
+| **本版字节在运行进程里** | **已确认**——两个修复的原始形状在重启后的进程里都按预测发生 | 见 §8 末表（**0.6 旧探针区分不出本版**） |
+
+### 1. 上一轮 §5 定的三条开局自检：全绿
+
+| 检查 | 结果 |
+|---|---|
+| `curl --noproxy "*" http://127.0.0.1:8080/health` | `{"status":"ok","model":"qwen3.8-flash-next-iq2_xs","max_context":262144,"images":true,"loaded":true}` |
+| `node scripts/sync-install.mjs --check` | 5 个文件全 `same`，exit 0 |
+| `node local-delegate.selftest.mjs` | **195 passed, 0 failed**（改动前）→ **199 passed, 0 failed**（本轮加了 4 条，见 §7） |
+
+### 2. 上一轮 §3 第一条未决项**已关闭**：`subagent` 在新主会话里可用
+
+上一轮的根因判断是对的：拒的是**会话级快照** `subagentModelSelectionPolicy`（值仍是**已被删除**的
+`qwen3.8-flash-next-coder-iq1_m`），它写在父会话头部、子会话继承，**跨重启保留**，所以那个会话里怎么试都没用。
+
+本轮在一个**新主会话**里直接调：
+
+```
+subagent { description: "subagent route probe", provider: "strata",
+           model: "qwen3.8-flash-next-iq2_xs", run_in_background: false,
+           prompt: "Output ONLY this raw JSON …: [7, 8, 9]" }
+→ [7, 8, 9]     （没有 "is not allowed for this Session"）
+```
+
+旁证（机检，不是眼看）：profile patch 的 `allowedModels` **只有新模型名**；整个 `profiles\desktop` 里
+旧模型名的残留**只剩 3 处，全在 `cordis.patch.yml.bak-before-hybrid-removal`**（备份，不参与加载）。
+**结论：不需要改 profile，换主会话即可**；这条不再是未决项。
+
+**但「换主会话即可」这句话本身要数清楚才敢说** —— 那个策略是**会话级 durable projection**
+（`@deepseek-ai/dsh-tool-subagent`：`init: () => null`，而 `recordSubagentModelSelection` 发现已有值就**直接 return**），
+所以**每个老会话都被永久钉在它创建时的那份清单上**。新增工具 `tools/session-route-policy.mjs`
+（只读，逐会话解到策略那一帧就停）实测本机 **248 个会话 / 47 个主会话**：
+
+| 主会话（depth 0）的策略 | 数量 | 含义 |
+|---|---:|---|
+| `allows-local` | **2** | 含当前模型（其中一个是本轮这个会话） |
+| `dead-route` | **23** | 钉在**已删除**的 `…coder-iq1_m` 上（22 个 strata + 1 个 qwen provider） |
+| `no-local-route` | **10** | 更早的清单，只有 deepseek/qwen 路由，从来没有本地引擎 |
+| `no-policy-record` | **12** | 无策略 = 不限制（固定路由） |
+
+→ **47 个主会话里只有 2 个允许本地路由；另外 33 个里 `subagent` 带着本地路由会被拒**
+（`child LLM route "…" is not allowed for this Session`，~23 ms）。
+**`delegate_batch` 不受影响**（它用预设自己的路由，不走会话策略）——这一点 10-13 那轮在
+`session-e0b91597`（正是上表里 dead-route 的第一行）里实测过：`subagent` 被拒、`delegate_batch` 一切正常。
+
+**处置**：老会话里继续用 `delegate_batch`，或**新开一个会话**（新会话拿到当前 `allowedModels`）。
+本轮**没有**去改写那 23 个会话的策略帧 —— 它不是系统性阻塞（0.12 那个空白会话会堵死「新会话」整条路，
+这个只影响"在被钉住的老会话里用 `subagent`"），而改会话文件按 0.12 的经验还要防内存缓存。
+若哪天真要批量修，照 `tools/session-set-preset.mjs` 的形状做（默认 dry-run、只改相关那一帧、逐帧复核）。
+**任何换模型的部署都要跑一次这个工具**，否则「本地模型能不能接到任务」在这个会话里的答案会被静默改变。
+
+### 3. 模块身份（0.6 的行为探针，不看 GUIDE）
+
+不带 `retries` 的必 FAIL 任务（期望 `[4,5,6]`、让它输出 `[1, 2, 3]`）→
+`FAIL ❌ — json_equals (2743 ms)`，结果行**没有** `attempts=2`、footer **没有** `retried`
+→ **`attempts=1 · 0 retried` = 磁盘那版新模块**（`retries` 默认 0 生效）。
+
+### 4. 回归门（§6 全部 8 条，改完并 sync 之后复跑，全绿）
+
+`node --check` exit 0 · 自检 **199 / 0** · `sync-install --check` up to date（同步前它如期报 3 个 `STALE`，
+这正是坑 A 的用法）· `build-local-delegate-preset.py --check` `up to date (9134 B)` ·
+两个 bundle `validate-preset-bundle` 均 `valid` · `check-profile-roster.py`
+**`OK: 5 presets, effective default 'local-delegate' resolves`** ·
+`session-headers.mjs --preset hybrid-router --blank` = **0**（0.12 那个「空白会话堵死新会话」的缺陷没有复发；
+会话总数已涨到 244）。
+
+> 本轮 roster 比 0.10 记录**多了一层** `dsh-project-memory./cordis.patch.yml`（新装的 bundle）。
+> 不影响结论：仍是 5 行预置、有效默认仍是 `local-delegate`。
+
+### 5. 端到端复核：上一轮 §7 的形状清单，在 0.1.43.1 + IQ2_XS @ `low` 上**全部通过**
+
+6 批 11 个任务、**≈23.6 s 本地算力、0 API token**（数字取自各批 footer，不是估算）：
+
+| 形状 | 门 | 实测 |
+|---|---|---|
+| 多步算术（120 件，卖 1/3 → 卖余 1/4 → 进 60） | `exact` | ✅ `got="120"`（2.5 s）—— **这就是 `low` 生效的证据**（`none` 会答 100） |
+| JSON 抽取（host/port/secure） | `json_equals` | ✅（2.4 s） |
+| 分类·划分（6 项分 fruits/vegetables） | `union_eq` | ✅ `union equals the universe (6 items, none filed twice)`（2.3 s） |
+| 摘要（覆盖 3 个机器取出的符号名） | `covers` + **`prove: true`** | ✅ `all 3 covered`（2.3 s）——prove 先证后跑，正常 |
+| 格式化（13 October 2026 → ISO） | `regex` | ✅（2.1 s，**不带 prove**，理由见 §6 缺陷 2） |
+| 可执行代码（`is_prime`，6 条断言） | `python_exec` | ✅（2.4 s） |
+| 计数（5 个元音） | `count` | ✅ `len=5`（1.9 s） |
+| **图像 OCR** | `all_of` | ✅ `all 2 found`（2.1 s） |
+| 真引用 / 伪造引用 | `citation`（`verify_task` 直调） | ✅ PASS / ✅ `FAIL — the evidence is fake: the quote is not in README.md:64 (±1)` |
+| 业务不变量 | `python_check`（`verify_task` 直调） | ✅ `python-check ok` |
+
+**视觉夹具要重建**：上一轮那 5 张 `%TEMP%\vision-fixtures\` 已被系统清理，本轮用 PIL 重新生成了
+`img-plain.png`（640×480、白底黑字、**44 px** 字，两张各一行）——一次 PASS，**1 步、无工具调用**。
+做法记在 §10，下次直接复用。
+
+### 6. 本轮新发现并修好的**两个真缺陷**（都是误导性诊断；各自都真实花掉了一次委派）
+
+两个都是在**照着上一轮 §7 的清单派发**时撞上的，不是翻代码翻出来的。
+
+**缺陷 1 —— `python_exec` 的 `asserts` 只吃表达式，写完整语句会报「Python 语法错误」**
+
+```text
+现象：asserts: ["assert is_prime(2) is True"]
+      → FAIL — Command failed: … probe.py, line 14
+               assert (assert is_prime(2) is True)
+               SyntaxError: invalid syntax
+根因：local-delegate.mjs 把每条 assert 包成 `assert (${a})`。契约（schema）写的是 "assertion
+      expressions"，但字段名就叫 `asserts`，写完整语句是最自然的读法。报错落在**生成出来的代码**上，
+      于是它指向模型的代码（这里是完全正确的 `is_prime`），指错了半边 —— 我据此白花了一次委派。
+修复：包之前先剥掉行首的 `assert` 关键字（`assert` 是 Python 关键字，合法表达式不可能以它开头）。
+      两种写法都行；自检两条钉住（见 §7），**把剥离去掉就恰好那两条失败**。
+证据：同一份 `is_prime` 用表达式写 → PASS（2.4 s）；新字节在独立进程里，语句写法 `ok:true`、
+      表达式写法 `ok:true`、**假断言仍然 `AssertionError`（证明剥离没把断言变成空操作）**。
+```
+
+**缺陷 2 —— `prove` 在四类「无结构算子」的门上永远无法认证，而 GUIDE 却叫调用方去传 `prove.positive`**
+
+```text
+现象：给 regex 任务带 prove: {positive: "2026-10-13"}（positive 是对的、也被接受了）→
+      FAIL — prove: gate has no power — `regex` has no structural mutant operator and its positive
+             example cannot be derived, so `prove` can never certify it …
+根因（两层）：
+  (a) 文案是**假的**：调用方刚刚**提供了** positive 且它被接受（positiveOk=true），
+      却被告知「positive example cannot be derived」；而且它没说这个任务**根本没跑**、也没说怎么跑得起来。
+  (b) GUIDE 原文写着「`python_exec`/`python_check`/`regex`/`citation` need `prove.positive` from you」
+      —— 照这句话做，必然撞上 (a)。README 里同样有一句「still need `prove.positive` from the caller」。
+修复：(a) proofWhy 把「调用方提供的 positive 被接受」单独分出来，直说 ACCEPTED、任务被拒而非被花掉、
+      并给出出路：**这类门不要传 `prove`**（不传就是「未证明但能用」）。
+      (b) GUIDE 改成 **DO NOT pass `prove` on python_exec/python_check/regex/citation**，README 同步纠正。
+证据：修后新字节同一条调用返回「…was ACCEPTED — that is expected, not a defect, and the task is
+      refused rather than spent. Drop `prove` for this kind…」；不带 prove 的同一个 regex 任务 PASS（2.1 s）。
+诚实边界：**这是文案与 GUIDE 的修复，不是语义变更**——这四类门依然无法被 prove 认证、依然拒绝执行
+      （上一轮 §6 第 6 条与此一致）。想让它们「证明后仍执行」是另一个设计决定，本轮**没做**。
+```
+
+### 7. 变异证明（两条修复各自有牙齿）
+
+在 **junction 之外的临时拷贝**里做，仓库文件没被碰（脚本：`%TEMP%\ld-mutate.py`）：
+
+| 变异 | 期望 | 实测 |
+|---|---|---|
+| M1 去掉 `asserts` 的行首 `assert` 剥离 | 恰好 1 条自检失败 | ✅ `198 passed, 1 failed`，失败的就是那条两者写法都要过的 |
+| M2 关掉 proofWhy 的「调用方 positive 被接受」分支（回到旧文案） | 恰好 1 条失败 | ✅ `198 passed, 1 failed`，失败的就是 ACCEPTED 那条 |
+| M3 GUIDE 恢复旧的「need `prove.positive` from you」 | 恰好 1 条失败 | ✅ `198 passed, 1 failed`，失败的就是 GUIDE 那条 |
+
+本轮自检 **195 → 199**（+4：`asserts` 两种写法、假断言仍失败、ACCEPTED 文案、GUIDE 不再误导）。
+
+### 8. 生效条件（**重要**）
+
+改了 **3 个文件**（`local-delegate.mjs` / `local-delegate.selftest.mjs` / `README.md`），已
+`sync-install`（3 个 `copied`，随后 `--check` up to date）。**但本会话内存里仍是旧模块实例**
+（0.6/0.12 的教训：模块每进程加载一次），所以：
+
+- 本轮**无法**用 `delegate_batch` 端到端复现两个修复 —— 那不是漏做，是环境决定的；
+  上面对新字节的验证是**独立 node 进程**里做的（同一条代码路径，不走 cordis 管道）。
+- 要让修复真正在会话里生效：**重启 DSH 本身**，然后先跑 0.6 的行为探针确认模块身份，
+  再重跑缺陷 1 / 缺陷 2 的原始形状（都应从 FAIL 变成「语句写法 PASS」和「拒了但文案给出出路」）。
+
+**重启后的验收（用户已重启，2026-10-13 21:33:35 起的进程；模块 21:31:48 写盘 → 进程晚于模块）**：
+三项全部按预测发生，两个修复**在真实会话里端到端生效**。
+
+| 项 | 形状 | 实测 |
+|---|---|---|
+| 缺陷 1（本版**专用**的身份探针） | `python_exec`，`asserts: ["assert double(21) == 42"]`（完整语句） | ✅ **PASS**（2.1 s）——上一版必然是 `assert (assert …)` 的 SyntaxError |
+| 缺陷 2（同上，探文案） | `regex` + `prove: {positive:"2026-10-13"}` | ✅ 被拒，且文案是新的：`…even though your positive example was ACCEPTED … Drop `prove` for this kind…`（旧版会说 "cannot be derived"） |
+| 无连带回归 | `covers` + **`prove: true`**（可派生的类） | ✅ 先证后跑，`all 3 covered`（2.3 s） |
+| 无连带回归 | 多步算术 `exact` | ✅ `got="120"`（2.4 s）→ `low` 仍生效 |
+| 视觉链路 | `img-plain.png` + `all_of` | ✅ `all 2 found`（2.4 s）——上一轮生成的夹具还在 `%TEMP%\vision-fixtures\` |
+| 磁盘侧 | `node local-delegate.selftest.mjs` | ✅ **199 / 0**；源码 ⇄ 安装副本指纹一致 |
+
+> ⚠️ **给下一轮的方法论更正**：0.6 那条「不带 `retries` 的必 FAIL 任务」探针只能区分
+> 「中间坏版本（默认 1）」与「磁盘版本（默认 0）」，**它区分不出本版与上一版**（两版都是默认 0）。
+> 要判定**这一版**是否在跑，用上表前两行（完整语句写法必须 PASS；`prove` 的拒绝文案必须带 `ACCEPTED` 与
+> `Drop `prove``）。**每次改模块后，都要给这一版留一条自己的身份探针**，否则"探针通过"会被误读成"新代码在跑"。
+
+### 9. 指纹（源码 = 安装副本，逐个用 SHA256 核对）
+
+| 文件 | SHA256(16) | 字节 |
+|---|---|---:|
+| `local-delegate.mjs` | `BA8A85C195A69DFB`（`774056C353067B3D` ← `A21E2B31F686E714` ← `60B3D4DE55512D8A`） | 111,375 |
+| `local-delegate.selftest.mjs` | `44C003FBF4D76F71`（`EAE5AA668FEC0152` ← `E4BBC95796C558FC` ← `408E4DB99467824A`） | 66,563 |
+| `README.md` | `26A54132B89BA373`（`DCDE160DD4126683` ← `E97A31E53762B133` ← `12CC6A0E9039EEB3`） | 76,149 |
+
+三个文件**源码与安装副本逐字节一致**。`cordis.patch.yml` 未改，仍是 `E52A9FEB360C4D38`（9,134 B，
+`build --check` up to date）。
+
+### 10. 仍然开着的 / 下次可直接复用的
+
+- **显卡 #779 提示**（0.1.43.1）：本机显卡同时驱动显示器，若加载后画面冻结/黑屏，用
+  `--vram-reserve-mib 1500` 重跑 setup。本轮**没有**出现冻结。
+- **长上下文**：可靠范围 ≤142K、145K 是不稳定区、231K 必失败；**委派 prompt 控制在 128K 以内**（上一轮实测）。
+- **`subagent` 无法从子代理手里拿走**（本插件做不到，只有 harness 能），只靠 120 s 预算兜底 —— 这是**结论**，不是待验项。
+- **重建视觉夹具**（上一轮的 5 张已被系统清理），一条命令即可：
+
+  ```powershell
+  $py = "C:\Users\14339\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe"
+  # PIL 画 640x480 白底 + C:/Windows/Fonts/arial.ttf 44px 两行字 → $env:TEMP\vision-fixtures\img-plain.png
+  ```
+
+  然后 `delegate_batch` 带 `images: ["<绝对路径>"]` + `verify: {kind:"all_of", expected:["MEN WALK ON MOON","SAMPLE 42 DELTA"]}`。
+
+### 11. 「领导模式」SOP 已写进 GUIDE（用户点名要求）
+
+**加了什么**：GUIDE 里新增一条 **LEADER MODE**（970 字符），把此前散在十几条 bullet 里的工具契约收成一个**操作循环**：
+拆成「每步都以一个可机器判定的结论收尾」→ **先写判据再派**（写判据就是"你理解了这一步"的证明；若写判据比做这一步还贵，就直接做）→
+派（`delegate_batch` 文本进文本出；要在文件里读、要看图的步骤走 `subagent`）→ **判决和载荷一起读**（PASS 只覆盖判据问过的部分）→
+FAIL 就**改点什么**（拆小、换问法、自己做），不要重发。同一条里写了两件事：citation 门的**天花板**
+（它验证的是**证据而非推论**——引用为真不等于结论成立，实测 2026-10-13：5 条引用全部成立，其中一条 claim 并不由它引的那行推出）；
+以及**三件不外放**的事（判据本身、跨文件因果/多步推理、用户要读的那句话）。
+
+**为什么放 GUIDE**：GUIDE 只给顶层、每轮重新求值，子代理拿不到；而「决策指挥」正是**子代理绝不该听到**的话
+（它的使命是 `you are the executor`）。这条差异被自检从**两个方向**钉住。
+
+**代价（诚实记账）**：GUIDE **10,517 → 11,390 字符**（净 +873；LEADER MODE 本身 970，同时把 LARGE JOB 那条里重复的半句删了 97）。
+按本 README 已记录的 ~4.09 字符/token 换算约 **+213 token**，即顶层每次请求多付约 210 token。
+**字符数是实测**（渲染出来的 section 文本），**token 数是换算、未重新实测**（要引擎侧 `usage.prompt_tokens` 才能实测）。
+CHILD_GUIDE 未动，仍是 625 字符。
+
+**自检 199 → 201**，两条新钉：顶层 GUIDE 必须含这个循环；**子代理必须拿不到它**（且其自己的文案里要有 `executor`）。
+**变异证明**：M4 把 `LEADER MODE` 改名 → **恰好 1 条**失败（新钉）；M5 让子代理谓词失效（子代理拿到全量 GUIDE）→ **5 条**失败，
+其中包含这条新钉 —— 说明它同时守住了「不许漏给子代理」这个方向。
+
+**生效条件**：这是 **GUIDE 文本**（prompt section），按 0.6 的实测**每轮重新求值**，所以**不需要重启**，
+下一轮顶层提示里就应出现 `LEADER MODE`；这与「改工具要重启」是两回事（**GUIDE 变了 ≠ 工具变了**，反之亦然）。
+**本轮无法在同一轮内自证**（我读不到本轮的 system prompt）。判据：下一轮的顶层提示里出现 `LEADER MODE`；
+若没出现，说明这条不成立，按工具变更处理（重启），并把结论写回这里。
+
+### 12. 形状账本写进 GUIDE + README（用户点名要求），以及一次真实项目分析的实测
+
+**第一次真正拿一个外部项目做的实测**：`C:\Users\14339\Desktop\git\dsh-session-sync`
+（DSH 的多机会话同步插件；基线 **35 文件 / 478,230 字节**）。做法：**我只列目录、只 grep 判据**，
+源码内容一律由本地模型读 —— 这正是「领导模式」的字面执行。
+
+**账本（本地侧是引擎日志精确值；我这一侧按字符估算）**
+
+| 项 | 值 |
+|---|---|
+| 本地请求数 | 5（1 个 `delegate_batch` 误用 + 2 个 `subagent` 各自多步 + 复用） |
+| 本地 prompt token（含前缀复用） | **111,684** |
+| 其中新预填 | 66,445 |
+| 其中**项目内容** | **47,752** token = **132,793 字节 @ 2.78 字符/token**（TS/JSON 比散文密） |
+| 本地生成 | 3,344 token |
+| 墙钟 / API token | **24.9 s / 0** |
+| 我这一侧（派发 + 判决 + 收结果） | **≈1,850 token**（≈6,500 字符） |
+
+**节省率**：口径 A（同样这份分析，不委派要读 132.8 KB ≈ 47.8K token）→ **≈96.0%**；
+口径 B（分析整个项目 478 KB ≈ 172K token）→ **≈98.3%**。
+
+**两个真实发现（都写进文档了）**
+
+1. **`delegate_batch` 的子代理没有工具，我却让它"去读五个文件"** → 它回
+   `I cannot read files … I will not invent symbol names` + `[]`，`covers` 门如实报 **41/41 missing**。
+   模型拒绝幻觉、门有牙齿 —— 代价只有 6 s 本地算力，但**这次派发报废**。改成 `subagent` 一次 PASS
+   （41 个符号，`set_eq` 精确通过）。
+2. **`subagent` 的答案要经我手两次**：`verify_task` 要求把答案**贴回**工具调用，于是它进我上下文两次
+   （这次 ~1,500 字符）。`delegate_batch` 插件内部验、**零回贴**。所以形状选择有了经济依据：
+   **纯文本派 `delegate_batch`（固定前缀 2.4K）；要读文件才用 `subagent`（固定前缀 15.3K），且要求答案紧凑**。
+
+**落地的两处改动**
+
+- **GUIDE**：在 `WHEN THE LOCAL MODEL NEEDS TOOLS` 那条末尾追加一句（~415 字符）：
+  `MEASURED SHAPE COST: ~2.4K vs ~15.3K … a subagent answer must be handed BACK into verify_task … crosses your context twice … Never hand a delegate_batch task a path to open`。
+  GUIDE **11,390 → 11,805 字符**（换算 ≈2,887 token，顶层每次请求多付 ~100 token）。
+- **README**：prompt-token 那节新增一条完整账本（含上表、两个节省率口径、以及"省的是钱和上下文，不是时间"）。
+
+**自检 201 → 202**（+1 条：GUIDE 必须含那三个事实），
+**变异**：三个事实各自被单独守住（改任一句 → 恰好 1 条失败）。
+⚠️ **诚实记录一次失败的变异**：第一版 M6 改的是标题（`MEASURED SHAPE COST:` → `SHAPE COST:`）→ **存活**。
+不是钉子有洞（它钉的是三个事实，标题没有语义），而是**变异选错了目标**；重做为三处事实变异后全部被抓。
+教训：**变异要落在断言真正覆盖的东西上**，否则"存活"会误导成"钉子没牙"。
+
+**一个副作用值得记**：顺带独立复核了项目里 `build/function-index/verification-report.json` 的
+`expected 384 / reported 384 / matched 384 / missing 0 / verdict true`（22 个文件）——citation 只证"引文为真"，
+这条是用 `ConvertFrom-Json` **另做的真验证**，代价 15 行输出而不是 4.7 KB 文件。
+**这正是「grounded ≠ true」那句话的正面用法：引文真，再补一次便宜的确定性检查。**
+
+### 13. 增强落地（用户批准：P1 → P3 → P4断言 → P2，顺手 P5/P6）
+
+**改了 `local-delegate.mjs` 五处**（都带自检与变异证明）：
+
+| # | 改动 | 关键设计点 |
+|---|---|---|
+| **P1** | `delegate_batch` 任务支持 **`files: [paths]`** | 插件读文本文件，内联进**同一个 text block**（新块类型会撞适配器的静默 `default: break`，这是 `inspectImages` 注释里那个坑）。上限 `DSH_DELEGATE_FILE_CHARS`（默认 200,000 字符 ≈ 72K token @2.78 字符/token，落在 ≤142K 可靠区内），**每次调用读**（照 `childBudgetMs` 的理由）。坏路径 = 该任务 FAIL **+ 不重试 + 不影响后续任务**（与坏图片路径同一契约）。 |
+| **P3** | **本地 token 账本**（逐任务 + 批次 footer） | `SubagentResult` **没有** usage 字段（运行构建声明只有 `output`/`structured`/`diagnostic`/`stopReason`），所以取引擎自己的 `/metrics.totals` 前后差。报 `N local tokens (P prompt: R read + U reused; G generated) · 0 API tokens`。**缺失或引擎重启（计数减少）→ 整行不出现，绝不猜**。读取器可注入（`setEngineTotalsReader`）——自检必须密闭，已默认注入 `() => null`。 |
+| **P2** | `verify_task` 支持 **`contentFile`** | 消掉「答案回贴」税；`contentFile` **优先于** `content`，两者不会静默打架；不可读/超限都是指名的 FAIL。 |
+| **P4** | **GUIDE / CHILD_GUIDE 体量预算断言** | 13,000 / 1,200 字符。今天 GUIDE 曾两次无闸增长（+873、+415）。 |
+| **P5** | 每任务 **`timeoutMs`** 覆盖全局预算 | 之前只有全局 env，一批里没法给慢任务更多时间。 |
+
+**自检 202 → 226**（+24 条，一次全过）。**变异 8/8 被抓**：M1 分隔符 / M2 fileError 契约 / M3 上限 / M4 减少保护 / M5 账本挂载 / M6 contentFile / M7 每任务预算 / M8 footer 账目。
+⚠️ **M2 第一次是"套件崩掉"而非"具名失败"**（那条断言没包 try/catch）→ 已按本仓库「verifier 异常曾整批 abort」的教训改成具名断言，复跑得到具名 FAIL。
+**教训：变异要落在断言真正覆盖的东西上；"崩掉"虽然也算被抓，比具名失败少一层信息。**
+
+**GUIDE 里那条规则被本次改动作废了，已同步改写**：`Never hand a delegate_batch task a path to open` →
+`NEVER paste a file into prompt yourself … use files: [..]`。GUIDE 11,805 → **12,237 字符**（预算 13,000，余 763）。
+
+### 14. P6 实测：前缀缓存在**一次子运行内**成立、**跨运行不成立**（更正上一轮的一句话）
+
+| 观察 | 数字 |
+|---|---|
+| 两个**逐字节相同**的 prompt 背靠背（同批两个任务） | **两次都是 `reused=0`**（各 2,342 prompt / 2,342 read） |
+| 两个共享 ~2.3K 前缀、只有尾巴不同的任务 | 同样 `reused=0` |
+| **同一个子运行**的第 2 步 | `prompt 16,597 = 15,327 reused + 1,270 read` ← 复用是真的 |
+
+机制：`/metrics` 报 `conversation_cache.enabled: false`、`budget_mib: 0`，因为 `min_free_mib: 2560` 对 `vram_free_mib: 225`
+—— **跨会话缓存被显存饿死**，不是预设配错。两个可操作结论：**(a)** 每个同批任务都付完整固定前缀（~2.4K ≈ 1.2 s 预填），
+所以**把小任务合并成更大的任务比拆开更省**；**(b)** 多步子代理每步只重读增量，15.3K 工具前缀不是每步成本。
+**这更正了上一轮 §4 那句「引擎有 prompt cache——同一 prompt 第二次发只需 0.2 s」**：那是运行内、或缓存开启时的观察，不是跨请求通则。
+
+**独立进程实读**（不是测试桩）：`readEngineTotals()` 对真引擎返回 `{"prompt":21677,"reused":0,"generated":134}`；
+`inspectFiles` 对真文件返回 `{"n":"package.json","chars":936}`。**注意引擎在本轮中途重启过**（totals.requests 从 106 归 4）——这正是 `tokenDelta` 的减少保护存在的理由。
+
+### 15. 生效条件（本轮与上一轮不同，别混）
+
+`files:` / 账本 / `contentFile` / 每任务 `timeoutMs` 都是**工具行为**，**必须重启 DSH** 才在会话里可用；
+而 GUIDE 里那几句说明是 **prompt section、下一轮就出现**。**两者不同步——不要用 GUIDE 判断工具是否生效**（0.6 的老教训）。
+
+**重启后的验收配方**（三条，都应过）：
+1. **账本**：任一 `delegate_batch` → footer 出现 `N local tokens (… ) · 0 API tokens`。
+2. **`files:`**：`{ tasks: [{ description: "inline-probe", prompt: "count the exports", files: ["<某个 .ts>"], verify: { kind: "contains", expected: "export" } }] }` → PASS，且**我不需要把文件内容贴进 prompt**。
+3. **`contentFile`**：把任一 >500 字符的答案写进文件，`verify_task { kind: "count", expected: "N", contentFile: "<path>" }` → PASS。
+
+> **判定本版字节在跑**：0.6 那条「默认 0」的探针**已区分不出本版**（上一版也是 0）。用**账本**判定：
+> 重启后第一次委派的 footer **必须带 token 账目**，旧版永远没有这一行。
+
+**重启后验收：三条配方全部通过（已完成）**
+
+| # | 配方 | 实测 |
+|---|---|---|
+| 1 | **账本** | 两个任务的 footer：`— 2/2 PASS · 8.1 s of local compute · 10,252 local tokens (9,937 prompt: 9,937 read + 0 reused; 315 generated) · 0 API tokens`。**与引擎原始计数器逐位吻合**：`/metrics` 里那两次请求是 `prompt=7594 gen=269` 与 `prompt=2343 gen=46`，合计正是 9,937 / 315。**这就是本版字节的身份判据**（旧版 footer 不可能有这一行）。 |
+| 2 | **`files:`** | 我**没有**把 `dsh-session-sync/src/host/transport.ts`（19.6 KB）贴进 prompt，只给了路径；`covers` 6 个 needle（早先 grep 机器取得）**全中**，任务行 `7,594+269 tok`。 |
+| 3 | **`contentFile`** | 子代理用 `write` 把答案写进 `%TEMP%\ld-accept-20261013.json`（595 B），我用 `{kind:"covers", contentFile: 路径}` → **all 29 covered**；再用 `set_eq` 判**同一条路径** → **PASS**（精确集合，无多报）。**答案全程没有进我的上下文**，我只看到判决。 |
+
+**顺带被独立印证的两条**：
+
+- **§14 的前缀复用**：该子代理三步的 `reused` = **0 / 15,649 / 20,514** —— 首次冷启不复用，运行内每一步都复用前一步前缀；
+  11.8 KB 的文件进了**子代理**的上下文，没进我的。
+- **单侧门 vs 精确门**：配方 1 那次 `covers` **放过了多报的 `"Server"`**（`covers` 只判漏报），而同一份答案用 `set_eq` 就会抓住它。
+  **要"没有多余项"，必须用 `set_eq`/`subset_of`，不能用 `covers`** —— 这条 §6 第 1、2 条早写了，这次是撞在自己身上的实证。
+
+**本轮指纹**（源码 = 安装副本）：`local-delegate.mjs` `D98C684112B9306F`（123,771 B）·
+`local-delegate.selftest.mjs` `0AB2105AE67182E8`（79,711 B）· `README.md` `2FAA234F4379236D`（79,803 B）。
+`cordis.patch.yml` 未改（`E52A9FEB360C4D38`）。回归门全绿：`node --check` ×2 · **226 / 0** · sync up to date ·
+`build --check` up to date · bundle `valid` · roster `OK: 5 presets`（`allows-local=25 / dead-route=150`，会话数 257）。
+
+### 16. 中文主说明（`README.zh-CN.md`）重写为权威用法文档
+
+**为什么重写而不是补**：那份是当天 21:10 的「精简版」，**它的红线 #1 已被本轮改动作废**——
+它写着"读原料型任务必须走 `subagent`，因为 `delegate_batch` 要内联、约等于 2× 基线的倒亏"，而 `files:` 正是为消除这条倒亏加的。
+一份**把已修好的限制当成红线**的主说明，比没有主说明更坏。
+
+**现在的分工**（写进三份文档的开头，避免再有人读到过期那份）：
+
+| 文件 | 定位 |
+|---|---|
+| `README.zh-CN.md` | **中文主说明（权威用法）**：契约、接口、判据、边界、运维、14 节 |
+| `README.md` | 英文完整版，保留**全部测量叙事与出处**（顶部新增指向中文主说明的导引） |
+| `NEXT-SESSION.md` | 交接单：开发过程、未决项、指纹 |
+
+**随包同步**：`sync-install.mjs` 的 `FILES` 从 5 个变 **6 个**（新增 `README.zh-CN.md`），
+`package.json` 的 `files` 从 `README.md` 改为 **`README*.md`**。安装副本现存两份文档（`README.md` 80,093 B / `README.zh-CN.md` 22,370 B）。
+
+**自检 226 → 228**，两条新钉（**主说明与英文 README 同一契约**）：
+文档必须**点名全部 16 个 kind**；必须同时含**「GUIDE 变了 ≠ 工具变了」的生效规则**、**`files:` 形状规则（`DSH_DELEGATE_FILE_CHARS`）**、**token 账本（`0 API tokens`）**。
+
+**变异**：M2 删 `files:` 规则、M3 删账本句 → **各自恰好 1 条具名失败**。
+⚠️ **M1 又一次"存活"了**，原因同上次：`union_eq` 在文档里出现 **2 次**，而我只替换了第一处。
+**全局替换后立刻抓到**（`the Chinese main document names every kind too ? union_eq`）。
+**教训（第二次撞同一块石头）：变异必须真的删净断言覆盖的东西——"替换一处"不等于"删掉这个事实"。**
+
+**不需要重启**：本轮改的是**文档 + 打包元数据**（`package.json` 的 `files` 只影响 npm 打包，不参与模块解析），
+模块行为一行未动（`local-delegate.mjs` 指纹仍是 `D98C684112B9306F`）。**GUIDE 也没有改**，所以下一轮提示词也不变。
+
+**新指纹**：`local-delegate.selftest.mjs` `31F3EF057D59B675`（80,942 B）· `README.md` `1DB95085F4A6264D`（80,093 B）·
+`README.zh-CN.md` `193EB596D7AC57E7`（22,370 B）· `package.json` `7B33A76F0AFCBC5D`（726 B）·
+`scripts/sync-install.mjs` `DF9A1FF303F457B5`（3,150 B）。自检 **228 / 0**，sync up to date，roster `OK: 5 presets`。
+
+### 17. 「主」落到**文件名**上：`README.md` = 中文主说明，英文退为 `README.en.md`
+
+§16 只是把中文那份**内容**写成主说明，但文件名仍叫 `README.zh-CN.md`——那名字本身就在说"这是个译本/变体"，
+而 `README.md` 才是任何工具、任何人在目录里第一眼打开的那份。本节把这件事做实：
+
+| 之前 | 之后 |
+|---|---|
+| `README.md` = 英文完整版 | **`README.en.md`** = 英文完整版（保留全部测量叙事与出处） |
+| `README.zh-CN.md` = 中文主说明 | **`README.md`** = **中文主说明**（22,364 B，14 节） |
+
+**做法与引用更新**：文件用**移动**完成（没有把 80 KB 读进上下文）；改了 5 处引用——
+`sync-install.mjs` 的 `FILES`、模块头两条注释（"see README.en.md for … the sources"）、两份文档开头互相指向的导引、以及自检的读文件路径。
+`package.json` 的 `files: ["README*.md"]` 本来就覆盖两者，未改。
+
+> ⚠️ **`sync-install` 只复制、不删除**：安装副本里于是留着一份**过期的 `README.zh-CN.md`（旧的中文精简版）**。
+> 已**先解析绝对路径、确认不是 reparse point**，再单独删掉；现在安装副本里是 `README.md` 22,364 B + `README.en.md` 80,101 B，与源码一一对应。
+> **下次重命名/下线文件时要记住这条**：同步工具不认识"删除"。
+
+**自检 228 → 229**，四条钉子（**两份文档同一契约，且指向不许交叉**）：
+主说明必须点名全部 16 个 kind；英文版同样必须；**主说明**必须含那三条规则（GUIDE vs 工具、`files:`、token 账本）；
+**两份文档的互相指向必须用新名字**（`README.en.md` / `主说明`），且**不许再出现 `README.zh-CN`**，并附带一条绊线
+（`主说明.length < 英文版.length` —— 中文主说明是提炼版，一旦比英文版还长，说明"交换没生效"或"主说明该拆了"，
+**这是一条提醒，不是正确性断言**）。
+
+**变异**：M1 把英文版指回旧名 → **抓到**。⚠️ **M2、M3 第一轮"存活"，又是我变异写弱**：
+- **M2**：`主说明` 在英文文档里出现 **2 次**，我只替换了一处——**这是我第三次犯同一个错**（前两次见 §13/§16 的教训）。
+  改成**全局替换**后立刻抓到。**机械规则：变异必须删净所有出现，不是替换第一处。**
+- **M3**：我垫了 60,000 字符以为够了，但比的是 JS `.length` 而**不是字节数**：主说明 `.length` 只有 **13,159**（中文 3 字节/字），
+  英文版 **79,260**。垫到 +150,000 后抓到。**教训：比较长度前先量真实长度，并按比较的单位（UTF-16 单元）构造变异。**
+
+**不需要重启**：本轮只动了文档、注释、`sync-install.mjs` 与自检（`package.json` 未变）。
+`local-delegate.mjs` 改了**注释**——指纹变了（`D98C684112B9306F` → `B923A7B54AF07CEE`，123,820 B），
+但**代码一行未动、GUIDE 一字未改**，所以运行行为与提示词都不变，无需重启、下一轮提示词也不变。
+
+**新指纹**：`local-delegate.mjs` `B923A7B54AF07CEE`（123,820 B）· `local-delegate.selftest.mjs` `4978CE617670F482`（81,727 B）·
+`README.md` `9315A055E8B4ABB7`（22,364 B）· `README.en.md` `7C09BD44C5E45A7F`（80,101 B）·
+`package.json` `7B33A76F0AFCBC5D`（未变）· `scripts/sync-install.mjs` `10194AED8529DBC1`（3,147 B）。
+
+**顺手核对的一条异常**：`profiles\desktop\bundles\dsh-preset-hybrid\` 这个目录**又出现在磁盘上**，但它是
+**空目录（0 文件）、时间戳 2026-10-02 19:30**，且 **roster 里没有 hybrid**（仍是 5 行）。所以它是不参与加载的残留，**不是 hybrid 复活**——
+0.11 那次删除删掉了文件，空壳留了下来。记在这里，免得下一个人看到目录就以为预设回来了。
+
+---
+
+## 上一轮（2026-10-13）：引擎/模型换代，以及两个真缺陷
 
 > **本节优先于下面所有 0.x 记录。** 0.x 写的是 10-02 那轮（coder 模型 + 引擎 0.1.35）的事，
 > 事实仍有效，但**当前机器上的版本已经完全换了**。读这一节就能开工。
@@ -186,12 +617,17 @@ JSON 抽取、四词分类、字符计数、`is_prime`（`python_exec` 6 断言�
 | `local-delegate.mjs` | `60B3D4DE55512D8A`（本轮**未改**） |
 | `local-delegate.selftest.mjs` | `408E4DB99467824A`（本轮**未改**） |
 | `README.md` | `12CC6A0E9039EEB3`（0.12 写回后，已 sync；此前依次为 `FC789979A93DCB31`、`6A82F878A340829E`、`2B3EF98E1962F694`、`BCF69D15203867E0`、`72E8F0EB55AFB394`） |
+
+> ⚠️ **这三个指纹已被上面「2026-10-13 二轮」的 §9 取代**（`A21E2B31F686E714` / `E4BBC95796C558FC` /
+> `E97A31E53762B133`）。本节以下所有出现 `60B3D4DE55512D8A` 的地方都是**历史值**，别拿它判断"哪个模块在跑"——
+> 那件事只能用 0.6 的行为探针。
 | `scripts/sync-install.mjs` | `D225D51552202305`（收尾提示改成"重启 DSH 本身"） |
 | `tools/asar-read.py`（仓库根，新） | `CD36F311512831D3` — 直读 `app.asar` 的 `--find/--grep/--cat` |
 | `tools/session-dump.mjs`（仓库根，新） | `B4BB192DBA302D17` — 逐帧解开 `session.v4.jsonl.zstd` |
 | `tools/check-profile-roster.py`（仓库根，新，0.10） | `31682D08E82EA31D`（8,807 B）— 从文件 + 运行构建合成 patch 栈，求出 roster 与有效默认预置 |
 | `tools/session-headers.mjs`（仓库根，新，0.12） | `328EB422CCD8D8DE`（4,411 B）— 逐会话只解第一帧，列出 `agentPreset`/空白/来源；`--preset X --blank` 找"被删预置卡住的空白会话" |
 | `tools/session-set-preset.mjs`（仓库根，新，0.12） | `6989D7FF206C8DBB`（4,771 B）— 默认 dry-run；只重写会话的**第 0 帧**改 `agentPreset`，其余帧逐字节不动，自带备份与逐帧复核 |
+| `tools/session-route-policy.mjs`（仓库根，新，2026-10-13 二轮） | `709F3631610C1164`（6,925 B）— 只读；逐会话解到 `subagentModelSelectionPolicy` 那一帧就停，按主/子会话列出「允许本地 / 钉在已删除模型 / 从无本地路由 / 无策略」。见上面 §3 末节 |
 | `dsh-preset-hybrid.removed-2026-10-02.zip`（仓库根，新，0.11） | `F76653AF06EEA90B`（377,315 B）— 被删三份 hybrid 拷贝的归档；**也是 0.10 正对照变异的夹具**，别删 |
 
 源与安装副本逐字节一致（`cordis.patch.yml` `E52A9FEB360C4D38`、`package.json` `3CE96894B05B9EBC`）。

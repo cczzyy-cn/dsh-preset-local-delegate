@@ -22,7 +22,7 @@
   "files": [
     "cordis.patch.yml",
     "*.mjs",
-    "README.md",
+    "README*.md",
     "scripts/"
   ]
 }

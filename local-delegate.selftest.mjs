@@ -18,9 +18,16 @@ import { dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import {
-  apply, buildChildRequest, check, inspectImages, looksDegenerate, matchesSchema, mutateAnswer,
-  needlesFrom, positiveFromVerify, probeEngine, proveGate, VERIFIER_KIND_IDS,
+  apply, buildChildRequest, check, fileBlock, inspectFiles, inspectImages, looksDegenerate,
+  matchesSchema, mutateAnswer, needlesFrom, positiveFromVerify, probeEngine, proveGate,
+  readEngineTotals, setEngineTotalsReader, tokenDelta, VERIFIER_KIND_IDS,
 } from './local-delegate.mjs'
+
+// HERMETIC BY DEFAULT. The token ledger reads the engine's own `/metrics`; a suite that hit a live
+// engine would be slower, would depend on the machine, and could pass or fail on what else ran
+// locally that second. So the reader is stubbed to "engine publishes nothing" for the whole suite,
+// and the ledger is driven explicitly in its own block below (that is what the seam is for).
+setEngineTotalsReader(() => null)
 
 let passed = 0
 let failed = 0
@@ -185,6 +192,26 @@ const pyPositive = check('python_exec', 'def f(n):\n    return n * 2\nprint("noi
 if (pyPositive.ok) ok('python_exec runs the extracted code and its asserts', true)
 else if (/ENOENT/.test(pyPositive.detail)) skip('python_exec runs the extracted code and its asserts', 'no python interpreter on PATH')
 else ok('python_exec runs the extracted code and its asserts', false, pyPositive.detail)
+
+// `asserts` are EXPRESSIONS, wrapped as `assert (<entry>)`. A caller who passes the whole statement
+// used to get `assert (assert …)` — a SyntaxError in GENERATED code, which the FAIL blames on the
+// model's code and sends the caller to fix the wrong half. Measured 2026-10-13: a correct `is_prime`
+// came back `SyntaxError: invalid syntax`. `assert` is a Python keyword, so nothing legitimate starts
+// an expression with it; the keyword is stripped before wrapping. Mutation: drop the `.replace(...)`
+// and BOTH pins below fail.
+const assertStmt = check('python_exec', 'def f(n):\n    return n * 2', undefined, undefined, ['assert f(21) == 42'])
+const assertExpr = check('python_exec', 'def f(n):\n    return n * 2', undefined, undefined, ['f(21) == 42'])
+if (assertStmt.ok && assertExpr.ok) {
+  ok('python_exec accepts both the statement and the expression spelling of an asserts entry', true)
+} else if (/ENOENT/.test(assertStmt.detail + assertExpr.detail)) {
+  skip('python_exec accepts both the statement and the expression spelling of an asserts entry', 'no python interpreter on PATH')
+} else {
+  ok('python_exec accepts both the statement and the expression spelling of an asserts entry', false,
+    JSON.stringify({ statement: assertStmt, expression: assertExpr }))
+}
+// …and stripping the keyword must not turn the entry into a no-op.
+ok('the tolerated statement spelling still FAILS when the assertion is false',
+  check('python_exec', 'def f(n):\n    return n * 2', undefined, undefined, ['assert f(21) == 43']).ok === false)
 
 console.log('\n# the delegated child request (pinned against the live provider contract)')
 
@@ -406,6 +433,28 @@ const childAgent = { session: { header: { delegationDepth: 1, origin: 'subagent'
 const childByOptions = { session: { header: {} }, options: { subagentDepth: 1 } }
 ok('the routing guide is given to the top-level agent',
   /deterministic checker/.test(asGuide(parentAgent)) && /escalate to DeepSeek/.test(asGuide(parentAgent)))
+// LEADER MODE is the top-level agent's operating loop: split -> checker -> dispatch -> read verdict
+// AND payload -> change something on FAIL. It must NOT reach a child, whose mandate is the opposite
+// one ("you are the executor"): a child told to "decide, direct and monitor" is a child that
+// re-delegates its own task, which is the measured runaway this preset budgets against.
+ok('the guide carries the LEADER MODE loop for the top-level agent',
+  /LEADER MODE/.test(asGuide(parentAgent))
+  && /VERDICT AND THE PAYLOAD/.test(asGuide(parentAgent))
+  && /change something/.test(asGuide(parentAgent)))
+ok('LEADER MODE is withheld from a delegated child, whose own mandate says it is the executor',
+  !/LEADER MODE/.test(asGuide(childAgent)) && /executor/.test(asGuide(childAgent)))
+// The shape rule (which path to use, and what each costs) belongs in the guide, not only in the
+// README: the caller picks a shape before it reads any documentation, and both failure modes are
+// silent-but-costly. Measured 2026-10-13: a tool-less child told to open five files answered
+// `I cannot read files … I will not invent symbol names` and returned [], so `covers` reported
+// 41/41 missing; and a `subagent` answer gated through `verify_task` crosses the caller's context
+// twice, because the caller must paste it back into its own tool call.
+ok('the guide carries the measured shape rule: files go in `files:`, and gating need not echo the answer',
+  /NEVER paste a file into `prompt` yourself/.test(asGuide(parentAgent))
+  && /contentFile/.test(asGuide(parentAgent))
+  && /crosses your context twice/.test(asGuide(parentAgent))
+  && /~15\.3K/.test(asGuide(parentAgent))
+  && /receipt for "0 API tokens"/.test(asGuide(parentAgent)))
 // The routing POLICY still stays with the parent, but a child is no longer told NOTHING: raising
 // maxDepth falsified the old "a delegated child has no tools here and cannot delegate", and a child
 // that re-delegated, or that polled job_* for a subagent id, burned budget that is never retried.
@@ -453,10 +502,38 @@ ok('the verify_task kind parameter enumerates every kind',
   JSON.stringify(verifyDef.parameters.properties.kind.enum) === JSON.stringify(VERIFIER_KIND_IDS))
 ok('the delegation schema enumerates the kinds too (the model chose blind before)',
   JSON.stringify(verifySchema.properties.kind.enum) === JSON.stringify(VERIFIER_KIND_IDS))
+// Two documents, two jobs, and both are pinned to the same list of kinds. `README.md` is now the
+// MAIN document (Chinese, the file people actually open first); `README.en.md` is the English full
+// version that keeps the measurement narrative. A main doc that silently stops naming a kind is
+// worse than no main doc, so each is checked on its own and the failure names the missing kind.
 const readmeText = readFileSync(fileURLToPath(new URL('./README.md', import.meta.url)), 'utf8')
-ok('the README documents every kind',
+const readmeEnText = readFileSync(fileURLToPath(new URL('./README.en.md', import.meta.url)), 'utf8')
+ok('the main README documents every kind',
   VERIFIER_KIND_IDS.every((id) => readmeText.includes(`\`${id}\``)),
   VERIFIER_KIND_IDS.filter((id) => !readmeText.includes(`\`${id}\``)).join(', '))
+ok('the English README documents every kind too',
+  VERIFIER_KIND_IDS.every((id) => readmeEnText.includes(`\`${id}\``)),
+  VERIFIER_KIND_IDS.filter((id) => !readmeEnText.includes(`\`${id}\``)).join(', '))
+// …and the MAIN one carries the three rules a reader must not be able to miss: the two disjoint
+// activation paths (guide text vs tool behaviour), the `files:` shape rule that REPLACED the old
+// "always inline" red line, and the receipt for "0 API tokens".
+const zhText = readmeText
+ok('the main README states the guide-vs-tool reload rule, the `files:` rule, and the token ledger',
+  /GUIDE 变了/.test(zhText) && /工具变了/.test(zhText)
+  && /DSH_DELEGATE_FILE_CHARS/.test(zhText)
+  && /local tokens/.test(zhText) && /0 API tokens/.test(zhText),
+  JSON.stringify({
+    reload: /GUIDE 变了/.test(zhText),
+    files: /DSH_DELEGATE_FILE_CHARS/.test(zhText),
+    ledger: /0 API tokens/.test(zhText),
+  }))
+// The two files must point at each other correctly — a swap that leaves the pointers crossed sends
+// the reader to the wrong document, which is exactly the failure this rename was meant to end.
+ok('the two READMEs cross-reference the swapped names, not the old ones',
+  /README\.en\.md/.test(readmeText) && /主说明/.test(readmeEnText)
+  && !/README\.zh-CN/.test(readmeText) && !/README\.zh-CN/.test(readmeEnText)
+  && readmeText.length < readmeEnText.length,
+  JSON.stringify({ mainPointsAtEnglish: /README\.en\.md/.test(readmeText), englishPointsAtMain: /主说明/.test(readmeEnText) }))
 
 const noEffect = fakeCtx({ effect: false, subagents: fakeSubagents(['[]']) })
 apply(noEffect.ctx)
@@ -698,6 +775,216 @@ ok('a bad image path does not abort the task after it',
   wiResult.results.length === 3 && wiResult.results[2].ok === true,
   JSON.stringify(wiResult.results.map((r) => r.ok)))
 rmSync(imgDir2, { recursive: true, force: true })
+
+console.log('\n# files: the caller stops paying for the bytes')
+
+// `files:` is the anti-paste path. Before it, "analyse this file" meant the CALLER pasting the file
+// into `prompt` — so the caller paid for those bytes in its own context, permanently, and the saving
+// that justifies delegating vanished for the shape that needs it most. Measured 2026-10-13: a
+// 132.8 KB analysis cost the caller ~1,850 tokens of dispatch and read-back. The second reason is a
+// measured FAIL: told to "read these five files", a tool-less child answered `I cannot read files …
+// I will not invent symbol names` and returned [], so the gate reported 41/41 missing — correct
+// behaviour, wasted call, because the tool contract gave the caller nowhere to put a path.
+const fileDir = mkdtempSync(join(tmpdir(), 'local-delegate-files-'))
+const srcFile = join(fileDir, 'sample.ts')
+const srcText = 'export const ALPHA = 1\nexport function beta() { return 2 }\n'
+writeFileSync(srcFile, srcText, 'utf8')
+const noSuchFile = join(fileDir, 'missing.txt')
+
+const inspected = inspectFiles([srcFile])
+ok('inspectFiles reads a text file for inlining',
+  inspected.length === 1 && inspected[0].chars === srcText.length && /ALPHA/.test(inspected[0].text),
+  JSON.stringify(inspected.map((f) => ({ p: f.path, c: f.chars }))))
+ok('a file is inlined as a DELIMITED block, so several files stay tellable apart',
+  /<<< file: .*sample\.ts \(\d+ chars\) >>>/.test(fileBlock(inspected[0]))
+  && /<<< end file: .*sample\.ts >>>/.test(fileBlock(inspected[0])),
+  fileBlock(inspected[0]).split('\n')[2])
+let filesThrew = null
+try { inspectFiles([noSuchFile]) } catch (e) { filesThrew = e }
+ok('a missing file is a readable error naming the path',
+  filesThrew !== null && /cannot read/.test(String(filesThrew.message)) && /missing\.txt/.test(String(filesThrew.message)),
+  filesThrew ? String(filesThrew.message) : 'did not throw')
+// The cap must be enforced, since `files:` removes the thing that used to bound the prompt — the
+// caller feeling those bytes in its own context first. Driven per call, like the child budget.
+process.env.DSH_DELEGATE_FILE_CHARS = '10'
+let capThrew = null
+try { inspectFiles([srcFile]) } catch (e) { capThrew = e }
+delete process.env.DSH_DELEGATE_FILE_CHARS
+ok('an oversized `files:` set is refused with the knob named, not sent and truncated',
+  capThrew !== null && /DSH_DELEGATE_FILE_CHARS/.test(String(capThrew.message))
+  && /(1[0])/.test(String(capThrew.message)),
+  capThrew ? String(capThrew.message) : 'did not throw')
+
+const fileReq = await buildChildRequest({ prompt: 'count the exports', files: [srcFile], provider: 'strata', model: 'm' })
+ok('buildChildRequest inlines files into the SINGLE text block (no new block type to be dropped silently)',
+  fileReq.prompt.length === 1 && fileReq.prompt[0].type === 'text'
+  && /ALPHA/.test(fileReq.prompt[0].text) && /count the exports/.test(fileReq.prompt[0].text)
+  && !fileReq.fileError,
+  JSON.stringify({ types: fileReq.prompt.map((b) => b.type), err: fileReq.fileError }))
+// Wrapped on purpose: the contract is "a bad path NEVER throws out of buildChildRequest" (an
+// exception there escapes into the batch loop and takes tasks 2..N with it). Without the wrap, a
+// mutation that removes the guard does not produce a named FAIL, it kills the whole suite — caught,
+// but far less usefully.
+let badFileReq = null
+let badFileThrew = null
+try {
+  badFileReq = await buildChildRequest({ prompt: 'x', files: [noSuchFile], provider: 'strata', model: 'm' })
+} catch (e) { badFileThrew = e }
+ok('an unreadable file becomes fileError on the REQUEST, not a throw out of buildChildRequest',
+  badFileThrew === null
+  && typeof badFileReq?.fileError === 'string' && /cannot read/.test(badFileReq.fileError)
+  && badFileReq.prompt[0].text === 'x',
+  badFileThrew ? `threw: ${String(badFileThrew.message)}` : JSON.stringify(badFileReq?.fileError))
+
+// End to end, with the same "one bad path must not take the batch down" contract as images.
+const withFiles = fakeSubagents(['[1]', '[1]'])
+const wf = fakeCtx({ effect: true, subagents: withFiles })
+apply(wf.ctx)
+const wfResult = await wf.tools.find((t) => t.name === 'delegate_batch').execute(
+  {
+    tasks: [
+      { description: 'reads a file', prompt: 'count the exports', files: [srcFile], verify },
+      { description: 'bad file', prompt: 'x', files: [noSuchFile], verify },
+      { description: 'after the bad one', prompt: 'p', verify },
+    ],
+  },
+  { agent: { id: 'parent' }, signal: undefined },
+)
+ok('a task with files sends their CONTENTS to the provider (the child never gets a path it cannot open)',
+  /ALPHA/.test(withFiles.requests[0].req.prompt[0].text)
+  && withFiles.requests[0].req.prompt.length === 1,
+  withFiles.requests[0].req.prompt[0].text.split('\n')[0])
+ok('a bad files path is a per-task FAIL naming the file, and is NOT retried',
+  wfResult.results[1].ok === false && wfResult.results[1].attempts === 1
+  && /missing\.txt/.test(wfResult.results[1].detail),
+  JSON.stringify(wfResult.results[1]))
+ok('a bad files path does not abort the task after it',
+  wfResult.results.length === 3 && wfResult.results[2].ok === true,
+  JSON.stringify(wfResult.results.map((r) => r.ok)))
+rmSync(fileDir, { recursive: true, force: true })
+
+console.log('\n# the local token ledger (the receipt for "0 API tokens")')
+
+// `SubagentResult` carries NO usage field — the running build declares only
+// `output`/`structured`/`diagnostic`/`stopReason` — so the cost cannot come from the result. It comes
+// from the engine's own `/metrics` as a before/after delta, which is exactly the arithmetic a human
+// had to do by hand twice from the engine log on 2026-10-13.
+const totalsA = { prompt: 1000, reused: 400, generated: 50 }
+const totalsB = { prompt: 3400, reused: 900, generated: 210 }
+ok('tokenDelta reports prompt, generated, and how much of the prompt was a prefix-cache hit',
+  JSON.stringify(tokenDelta(totalsA, totalsB))
+  === JSON.stringify({ prompt: 2400, reused: 500, generated: 160, read: 1900 }),
+  JSON.stringify(tokenDelta(totalsA, totalsB)))
+ok('a DECREASE is a restarted engine, not a negative cost — reported as absent',
+  tokenDelta({ prompt: 5000, reused: 0, generated: 0 }, { prompt: 10, reused: 0, generated: 0 }) === null)
+ok('an unavailable ledger is null, never a guess',
+  tokenDelta(null, totalsB) === null && tokenDelta(totalsA, null) === null)
+
+// The reader is called once before and once after each task, so the script supplies that pair.
+const readings = [totalsA, totalsB]
+setEngineTotalsReader(async () => readings.shift() ?? null)
+const ledgerTool = fakeCtx({ effect: true, subagents: fakeSubagents(['[1]']) })
+apply(ledgerTool.ctx)
+const ledgerBatch = ledgerTool.tools.find((t) => t.name === 'delegate_batch')
+const ledgerResult = await ledgerBatch.execute(
+  { tasks: [{ description: 'measured', prompt: 'p', verify }] },
+  { agent: { id: 'parent' }, signal: undefined },
+)
+ok('a task carries the local tokens it cost, as a before/after delta of the engine totals',
+  JSON.stringify(ledgerResult.results[0].tokens) === JSON.stringify(tokenDelta(totalsA, totalsB)),
+  JSON.stringify(ledgerResult.results[0].tokens))
+const ledgerRender = ledgerBatch.output.render({}, ledgerResult)[0].text
+ok('the per-task line shows the tokens, so the caller sees what the path cost',
+  /2,400\+160 tok/.test(ledgerRender), ledgerRender.split('\n')[0])
+ok('the footer is the receipt: prompt split into read/reused, plus 0 API tokens',
+  /2,560 local tokens \(2,400 prompt: 1,900 read \+ 500 reused; 160 generated\) · 0 API tokens/.test(ledgerRender),
+  ledgerRender.split('\n').pop())
+setEngineTotalsReader(() => null)
+const noLedger = fakeCtx({ effect: true, subagents: fakeSubagents(['[1]']) })
+apply(noLedger.ctx)
+const noLedgerTool = noLedger.tools.find((t) => t.name === 'delegate_batch')
+const noLedgerResult = await noLedgerTool.execute(
+  { tasks: [{ description: 'unmeasurable', prompt: 'p', verify }] },
+  { agent: { id: 'parent' }, signal: undefined },
+)
+const noLedgerRender = noLedgerTool.output.render({}, noLedgerResult)[0].text
+ok('an engine with no /metrics drops the ledger line instead of printing a zero it cannot stand behind',
+  noLedgerResult.results[0].tokens === undefined
+  && !/local tokens/.test(noLedgerRender)
+  && /s of local compute/.test(noLedgerRender),
+  noLedgerRender.split('\n').pop())
+// A reader that THROWS must degrade the same way — a broken ledger cannot fail a delegation.
+setEngineTotalsReader(async () => { throw new Error('metrics endpoint exploded') })
+const boomLedger = fakeCtx({ effect: true, subagents: fakeSubagents(['[1]']) })
+apply(boomLedger.ctx)
+const boomResult = await boomLedger.tools.find((t) => t.name === 'delegate_batch').execute(
+  { tasks: [{ description: 'ledger down', prompt: 'p', verify }] },
+  { agent: { id: 'parent' }, signal: undefined },
+)
+setEngineTotalsReader(() => null)
+ok('a throwing totals reader is a missing ledger, not a failed task',
+  boomResult.results[0].ok === true && boomResult.results[0].tokens === undefined,
+  JSON.stringify(boomResult.results[0]))
+
+console.log('\n# per-task budget and file-backed verification')
+
+// The budget used to be global env only, so a batch could not give a slow task more room than a fast
+// one without moving everyone's ceiling.
+process.env.DSH_DELEGATE_TIMEOUT_MS = '5000'
+const perTaskHang = hangingSubagents()
+const ptb = fakeCtx({ effect: true, subagents: perTaskHang })
+apply(ptb.ctx)
+const ptbStart = Date.now()
+const ptbResult = await ptb.tools.find((t) => t.name === 'delegate_batch').execute(
+  { tasks: [{ description: 'hang', prompt: 'p', timeoutMs: 150, verify }] },
+  { agent: { id: 'parent' }, signal: undefined },
+)
+const ptbElapsed = Date.now() - ptbStart
+delete process.env.DSH_DELEGATE_TIMEOUT_MS
+ok('a per-task timeoutMs overrides the global budget for that task only',
+  ptbResult.results[0].ok === false && /150 ms budget expired/.test(ptbResult.results[0].detail)
+  && ptbElapsed < 1000,
+  `${ptbElapsed} ms — ${ptbResult.results[0].detail}`)
+
+// `contentFile` is the anti-echo path for the tool-using route: a `subagent` carries no verifier, so
+// its answer must be gated by the caller — and pasting it back puts it through the caller's context a
+// second time (measured: ~1,500 characters on the 2026-10-13 project analysis).
+const vDir = mkdtempSync(join(tmpdir(), 'local-delegate-verify-file-'))
+const answerFile = join(vDir, 'answer.json')
+writeFileSync(answerFile, '{"count": 16, "last": "python_check"}', 'utf8')
+const vtTool = wired.tools.find((t) => t.name === 'verify_task')
+const byFile = await vtTool.execute({
+  kind: 'json_equals', expected: '{"count": 16, "last": "python_check"}', contentFile: answerFile,
+})
+ok('verify_task can gate an answer BY PATH, so it never has to be pasted back through the caller',
+  byFile.ok === true, JSON.stringify(byFile))
+const byFileWins = await vtTool.execute({
+  kind: 'json_equals', expected: '{"count": 16, "last": "python_check"}', content: 'wrong', contentFile: answerFile,
+})
+ok('contentFile wins over content, so the two cannot silently disagree', byFileWins.ok === true, JSON.stringify(byFileWins))
+const byFileMissing = await vtTool.execute({
+  kind: 'json_equals', expected: 'x', contentFile: join(vDir, 'nope.json'),
+})
+ok('an unreadable contentFile is a FAIL naming the path, not a throw',
+  byFileMissing.ok === false && /contentFile: cannot read/.test(byFileMissing.detail)
+  && /nope\.json/.test(byFileMissing.detail),
+  byFileMissing.detail)
+process.env.DSH_DELEGATE_FILE_CHARS = '5'
+const byFileBig = await vtTool.execute({ kind: 'contains', expected: 'count', contentFile: answerFile })
+delete process.env.DSH_DELEGATE_FILE_CHARS
+ok('an oversized contentFile is refused with the knob named',
+  byFileBig.ok === false && /DSH_DELEGATE_FILE_CHARS/.test(byFileBig.detail), byFileBig.detail)
+rmSync(vDir, { recursive: true, force: true })
+
+console.log('\n# the guide has a budget')
+
+// The guide is paid by the top-level agent on EVERY request, and it grew twice on 2026-10-13 (+873
+// then +415 characters) with nothing to notice. A budget makes the next growth a decision instead of
+// drift — failing here is the prompt saying "this got more expensive", not a defect in the preset.
+ok('the routing guide stays inside its character budget',
+  asGuide(parentAgent).length <= 13000, `${asGuide(parentAgent).length} chars (budget 13000)`)
+ok('the child notes stay far inside their budget',
+  asGuide(childAgent).length <= 1200, `${asGuide(childAgent).length} chars (budget 1200)`)
 
 console.log('\n# the verified payload survives the verdict')
 
@@ -1039,6 +1326,30 @@ const brokenUnstructured = await verifyTool.execute({
 ok('an unstructured kind that rejects its positive is still reported as rejecting it',
   brokenUnstructured.ok === false && /does not accept/.test(brokenUnstructured.detail),
   JSON.stringify(brokenUnstructured))
+
+// The OTHER unstructured case, and it used to report a false sentence. When the positive came from
+// the caller and this gate ACCEPTED it, "its positive example cannot be derived" is simply untrue —
+// measured 2026-10-13, `regex` + a correct prove.positive — and the message named no way out, so a
+// caller doing exactly what the GUIDE then said hit a dead end. It must say what happened (accepted,
+// no structural operator) and what to do (drop `prove`). Mutation: restore the old one-line message
+// and exactly this case fails.
+const acceptedUnstructured = await verifyTool.execute({
+  kind: 'regex', expected: '^2026-10-13$', content: '2026-10-13', prove: { positive: '2026-10-13' },
+})
+ok('an unstructured kind with an ACCEPTED caller positive says so and names the remedy, not "cannot be derived"',
+  acceptedUnstructured.ok === false
+  && /no structural mutant operator/.test(acceptedUnstructured.detail)
+  && /ACCEPTED/.test(acceptedUnstructured.detail)
+  && /Drop `prove`/.test(acceptedUnstructured.detail)
+  && !/cannot be derived/.test(acceptedUnstructured.detail),
+  JSON.stringify(acceptedUnstructured))
+// The GUIDE is what tells a caller to pass `prove` in the first place, so the false promise has to be
+// gone from it too — not just from the message. Mutation: put the old "need `prove.positive` from
+// you" wording back and this case fails.
+const liveGuide = String(asGuide(parentAgent))
+ok('the GUIDE no longer tells callers to pass prove.positive on the four uncertifiable kinds',
+  /DO NOT pass `prove` on/.test(liveGuide) && !/need `prove\.positive` from you/.test(liveGuide),
+  liveGuide.slice(liveGuide.indexOf('PROVE THE GATE'), liveGuide.indexOf('PROVE THE GATE') + 430))
 
 console.log('\n# engine preflight')
 
