@@ -1,4 +1,130 @@
 # 新会话交接单 — `local-delegate` 预设的收尾验证
+## 最新一轮（2026-10-13）：引擎/模型换代，以及两个真缺陷
+
+> **本节优先于下面所有 0.x 记录。** 0.x 写的是 10-02 那轮（coder 模型 + 引擎 0.1.35）的事，
+> 事实仍有效，但**当前机器上的版本已经完全换了**。读这一节就能开工。
+
+### 0. 当前状态（2026-10-13，逐项实测过）
+
+| 层 | 值 | 怎么确认 |
+|---|---|---|
+| Strata 源码 | `a0116b27` = **v0.1.43.1** | `git -C <strata> log --oneline -1` |
+| 引擎 | `engine/BUILD.json` = **0.1.43.1** | 引擎日志会自报 `session is up (engine 0.1.43.1)` |
+| 模型 | **qwen3.8-flash-next-iq2_xs**（2-bit 通用，数据在 **D:** 盘） | `curl http://127.0.0.1:8080/health` |
+| 引擎窗口 | **262144**，KV int8，`--kv-resident 32768`，images on | 同上 |
+| 推理档位 | **`low`**（引擎 shared default，`strata-iq2_xs.shared-settings.json`） | `curl http://127.0.0.1:8080/settings` |
+| DSH 路由 | `strata/qwen3.8-flash-next-iq2_xs`，`contextWindow 262144` / `maxTokens 8192` | `list_subagent_models provider=strata` |
+| preset | 源码 ⇄ 安装副本**已同步**，selftest **195 / 0** | `node scripts/sync-install.mjs --check` |
+
+**注意**：`coder-IQ1_M` 已被**删除**（用户要求）。任何还写着 `qwen3.8-flash-next-coder-iq1_m` 的
+地方都是**过时残留**，它不再存在于引擎里。
+
+### 1. 本轮动了什么
+
+1. **Strata 从 0.1.29 提到 0.1.43.1**。中途差点被坑：本机上 GitHub 直连会被 reset，而 setup 的
+   `urllib` 读的是**系统代理**；系统代理关着时它超时，于是 setup 判定"没有现成引擎"、**转去下载并安装
+   CUDA Toolkit 13.0（8-10 GB）**。我及时终止，CUDA **没有被安装**。正确做法是**手动把 release 里的
+   `strata-windows-x64.zip` 解到 `engine/`**（`tar -xf`）。
+2. **换模型**：coder-IQ1_M（32 GB 档）→ **qwen IQ2_XS**（48 GB 档），因为本机内存升到了 70 GB。
+   下载 68 GB 时 setup 自带的下载器实测只有 **17 KB/s**（同一代理下 curl 是 **28 MB/s**，差三个数量级），
+   所以最终用 `curl` 下载、写成 `.part`、再让 setup 校验收尾。
+3. **推理档位从 `none` 改为 `low`**，理由见下面的坑 B。
+4. **preset 侧**：GUIDE 里那句"Thinking buys nothing here / 已经是 `none`"已重写为以**正确性**为由跑
+   `low`；两份 README 的模型 id 同步；`LOCAL_MODEL` 默认值改为新模型名。
+5. **两份 README 顶部加了 `[!IMPORTANT]` 告示块**，写的就是坑 A。
+
+### 2. 两个必须知道的坑（本轮各踩了一次）
+
+**坑 A —— `sync-install.mjs`：「我重新装过了」这句话会骗你。**
+preset 是以 `file:` 目录依赖装进 `<profile>/node_modules/dsh-preset-local-delegate/` 的，而 pnpm 按键控
+**manifest** 而不是内容。所以改完 `local-delegate.mjs` 再"重新安装"，它会打印 `Already up to date`，
+而 harness 跑的还是**旧模块**。本轮后果：`LOCAL_MODEL` 默认值仍是已删除的 coder 模型名，与 provider 的
+模型列表不匹配，于是**每一次委派都在 23 ms 内被拒**：
+
+```
+child LLM route "strata/qwen3.8-flash-next-iq2_xs" is not allowed for this Session
+```
+
+**动作**：改完 preset 后
+```bash
+node scripts/sync-install.mjs --check   # 退出码 1 = 线上副本是旧的
+node scripts/sync-install.mjs           # 复制并逐文件报告
+```
+然后**重启 DSH 本体**——同进程里开新会话会复用已加载的模块实例，**"我开了个新会话"不算重启**。
+
+**坑 B —— `reasoning_effort` 不是速度问题，是**对错**问题。**
+`none` 下模型做多步算术会**静默答错**（"120 件，先卖 1/3，再卖剩余的 1/4，再进 60"→ 答 `100`，
+正确答案 `120`；只生成 4 个 token，**看不出任何犹豫**）。`low` 就答对（104 token，1.0 s）。
+`low` / `medium` / `high` 在延迟和正确率上**无法区分**，所以真正的选择只有 `none` 与 `low`+ 两档。
+简单任务（抽取、JSON、代码、读图）**各档都对**，所以这个设置约 +0.7 s、~100 token/次，
+只在多步推理上有回报。**不要为了快把它调回 `none`。**
+
+### 3. 已知未决项
+
+- **`subagent` 工具在本会话被拒**（`delegate_batch` 不受影响，一切正常）。根因是**会话级**快照
+  `subagentModelSelectionPolicy` 仍是旧模型名：
+  ```json
+  "subagentModelSelectionPolicy": { "val": [ {"provider":"strata",
+                                              "model":"qwen3.8-flash-next-coder-iq1_m"} ] }
+  ```
+  它存在于**父会话**里（`seq` 很大），**子会话继承**它。profile patch 的 `allowedModels` **已经是新名**
+  （已核对），但**会话快照跨重启保留**。→ **新开一个主会话应该就能用 `subagent`**；本会话内它始终用旧值。
+- **0.1.43.1 带来的 #779 提示**：本机显卡同时驱动显示器，若加载后**画面冻结/黑屏**，用
+  `--vram-reserve-mib 1500` 重跑 setup。
+- 长上下文实测边界（见第 4 节）：**> ~145K token 会静默崩塌，> 230K 必失败**，
+  虽然配置允许 262144。
+
+### 4. 长上下文实测（IQ2_XS @ 256K，用真实文档做的针测试）
+
+| prompt token | 结果 |
+|---|---|
+| 6K / 29K / 60K / 115K / 122K / 129K / 133K / 138K / 142K | ✅ 全部找到（含多针区分） |
+| **145K** | ⚠️ 一次失败、一次成功 → **不稳定区** |
+| 154K | ✅（单次） |
+| **231K** | ❌ 2/2 失败 |
+
+**失败模式要注意**：越界后不是"找不到针"，而是**指令跟随整体崩塌**（开始说无关的话，甚至答
+`I can help with the A770`），**输出还会撞满 max_tokens**。所以不能靠"答案看起来合理"判断它是否还在状态。
+**结论：可靠范围 ≤ 142K，实际使用请把委派 prompt 控制在 128K 以内。**
+
+**附赠发现**：引擎有 **prompt cache**——同一 prompt 第二次发只需 **0.2 s**（首次 47 s），所以对同一份长
+文档连续问多个问题，只有第一次要付时间。另外长 prompt 的处理速率反而更高（~2,600–3,000 tok/s）。
+
+### 5. 新会话开头的三条自检
+
+```powershell
+curl.exe -sS --noproxy "*" "http://127.0.0.1:8080/health"   # 模型/窗口/loaded
+node scripts/sync-install.mjs --check                        # preset 副本是否同步（exit 1 = 旧）
+node local-delegate.selftest.mjs                             # 期望 195 passed, 0 failed
+```
+
+### 6. 门配对的 7 个坑（本轮实测，全部是我自己踩的）
+
+1. **`subset_of` 不保证完整**——空数组也满足它。"没有多余项" ≠ "没有遗漏"。
+2. **`set_eq` 不管重复**——要防重复必须用 `python_check`（`len(a) == len(set(a))`）。
+3. **`all_of` 是「且」不是「或」**——`"正方形|矩形"` 永远无法满足；要「或」请用 `regex`。
+4. **`regex` 不支持 `(?i)`**（JS 风格）→ `Invalid group`。
+5. **`regex`/`python_exec`/`python_check`/`citation` 的 `prove` 必须自带 `prove.positive`**，
+   否则报 `no positive example`。
+6. **`python_check` 根本无法 `prove`**（无结构变异算子）→ 只能**手工验证**；插件会明说这是
+   expected、不是缺陷。
+7. **`covers` 的 needles 要宽容近义词**——模型写「**售价** 899 元」而 needle 是「价格」就会误判。
+
+**另外**：1、2、6 这几种门**插件会主动拒绝执行**（`gate has no power`），**不会浪费一次委派**——
+这正是 `prove` 的价值，不要因为被拒就去掉它。
+
+### 7. 本轮实测通过的任务形状（可放心委派）
+
+抽取·分类/划分（`union_eq`）·摘要（`covers`）·翻译·格式化（`regex`）·可执行代码（`python_exec`）·
+多步算术（`exact`，需 `low`）·计数·**图像 OCR 与视觉问答**（图要够清晰，字至少 40 px）·
+日志→表格（`json_equals`）·任意业务不变量（`python_check`）。
+
+**委派 6/6 通过的那组**（2026-10-13，`delegate_batch`，14.1 s 本地算力）：多步算术答 `130`、
+JSON 抽取、四词分类、字符计数、`is_prime`（`python_exec` 6 断言）、固定槽位摘要。
+
+---
+
+
 
 > 给**下一个在 `Local Delegate` 预置上开会话的 agent（或人）**。
 > 本文件自包含：不需要本轮对话的上下文。
