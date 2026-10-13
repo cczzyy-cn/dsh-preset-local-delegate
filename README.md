@@ -30,6 +30,25 @@ style preference: a wrong local answer that is *rejected by a verifier* costs th
 Pass rate is therefore the only number that matters. It applies to a picture exactly as it does
 to text: a vision answer with no checker is not delegable either.
 
+> [!IMPORTANT]
+> **Editing this preset? The obvious signal lies.** The bundle is installed into
+> `<profile>/node_modules/dsh-preset-local-delegate/` as a `file:` dependency, and pnpm keys such
+> a dependency by its **manifest**, not by its contents — so after editing `local-delegate.mjs` a
+> re-install prints *"Already up to date"* while the harness keeps running the **old module**.
+> Measured 2026-10-13: that cost a long debugging session in which every delegation was refused
+> with `route "strata/qwen3.8-flash-next-iq2_xs" is not allowed`, because the live copy still held
+> the deleted model id as `LOCAL_MODEL`.
+>
+> **Two commands after every edit:**
+>
+> ```bash
+> node scripts/sync-install.mjs --check   # exit 1 means the live copy is stale
+> node scripts/sync-install.mjs           # copy, and report exactly which files changed
+> ```
+>
+> **Then restart DSH itself** — a new session inside the same process keeps the old module
+> instance (measured 2026-10-02), so "I opened a new session" is not a restart.
+
 ## What it adds
 
 | Added row | What it registers |

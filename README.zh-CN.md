@@ -8,6 +8,24 @@
 
 ---
 
+> [!IMPORTANT]
+> **改这个预设前必读：正常的信号会骗你。** 它是以 `file:` 目录依赖装进
+> `<profile>/node_modules/dsh-preset-local-delegate/` 的，而 pnpm 按 **manifest** 而不是内容来键控——
+> 所以改完 `local-delegate.mjs` 再"重新安装"，它会打印 *"Already up to date"*，而 harness 跑的还是
+> **旧模块**。2026-10-13 实测：这导致每次委派都被拒绝，报
+> `route "strata/qwen3.8-flash-next-iq2_xs" is not allowed`，因为线上那份的 `LOCAL_MODEL`
+> 还留着已删除的模型 id。
+>
+> **每次改完都跑这两条：**
+>
+> ```bash
+> node scripts/sync-install.mjs --check   # 退出码 1 = 线上副本是旧的
+> node scripts/sync-install.mjs           # 复制，并逐文件报告改了什么
+> ```
+>
+> **然后必须重启 DSH 本体**——同进程里开新会话会复用旧模块实例（2026-10-02 实测），
+> 所以"我开了个新会话"不算重启。
+
 ## 一、它解决什么问题
 
 本地引擎（本机 Strata，`qwen3.8-flash-next-iq2_xs`）免费但**不可靠**：同一个 prompt 发三次可能两次对、一次烧满 120 秒预算。API token 贵但可靠。

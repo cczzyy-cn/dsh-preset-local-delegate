@@ -77,14 +77,14 @@ const NON_COMPLETED_STOPS = new Set(['max-tokens', 'aborted', 'error', 'refusal'
 
 /** The local route. `strata` is the provider row the deployment registers for its engine. */
 const LOCAL_PROVIDER = process.env.DSH_LOCAL_PROVIDER || 'strata'
-const LOCAL_MODEL = process.env.DSH_LOCAL_MODEL || 'qwen3.8-flash-next-coder-iq1_m'
+const LOCAL_MODEL = process.env.DSH_LOCAL_MODEL || 'qwen3.8-flash-next-iq2_xs'
 
 /**
  * Per-call reasoning effort, or '' for "leave it to the provider".
  *
  * Default is '' on purpose: the `strata` provider advertises no reasoning efforts, and asking
  * for one is rejected before the request is sent —
- *   provider "strata" model "qwen3.8-flash-next-coder-iq1_m" does not support reasoning effort "none"
+ *   provider "strata" model "qwen3.8-flash-next-iq2_xs" does not support reasoning effort "none"
  * (measured 2026-10-01 against the live harness). To delegate with thinking OFF, either declare
  * the effort in the provider config or set the engine's shared default; README.md has both.
  */
@@ -96,7 +96,7 @@ const REASONING_EFFORT = process.env.DSH_LOCAL_REASONING_EFFORT || ''
  * This is a COST decision, not a capability claim. An earlier revision of this comment said the
  * local model "has no tool loop": that is true of the engine's own HTTP API and FALSE of a
  * delegated child, because the harness supplies the loop. Measured (2026-10-01, 0 API tokens): a
- * child on `strata/qwen3.8-flash-next-coder-iq1_m` called `read` and answered from the file, and
+ * child on `strata/qwen3.8-flash-next-iq2_xs` called `read` and answered from the file, and
  * called `glob` then `read_image` and read a picture correctly — two tool steps.
  *
  * The reason to strip anyway: a 3-line, 12-token task produced a **13,023-token** prompt with the
@@ -241,8 +241,8 @@ const GUIDE =
   + 'A gate with no discriminating power is reported instead of being used, so a decorative verifier costs nothing. Switch on a `semantics` flag only when the mutant really is wrong — a false alarm condemns a gate that is fine.\n'
   + '- READ THE WHOLE ANSWER. A task verdict that PASSes carries only a short `raw` echo; when the answer is longer, the plugin WRITES the full answer to disk and returns `outputFile` (with bytes and sha256). Read that file instead of re-running the task — a delegated child has no tools, so it cannot write the file itself.\n'
   + '- WHEN THE LOCAL MODEL NEEDS TOOLS, CALL `subagent` INSTEAD OF `delegate_batch`. `delegate_batch` strips every tool on purpose (measured: a 13,023-token prompt with the inherited schemas and a 5,606 ms cold prefill, versus 2,780 tokens stripped), because its shapes are text in / text out. '
-  + 'But a delegated child DOES inherit tools — the harness supplies the loop — measured on `strata/qwen3.8-flash-next-coder-iq1_m`: a child used `read` and answered from the file, and used `glob` then `read_image` to read a picture correctly, both for 0 API tokens. '
-  + 'So for "open these files" or "read this screenshot", call `subagent(provider="strata", model="qwen3.8-flash-next-coder-iq1_m")`: ~5.6 s for the first step, then ~1 s per step through the prefix cache. It carries NO verifier, so gate the answer with `verify_task` yourself before using it.\n'
+  + 'But a delegated child DOES inherit tools — the harness supplies the loop — measured on `strata/qwen3.8-flash-next-iq2_xs`: a child used `read` and answered from the file, and used `glob` then `read_image` to read a picture correctly, both for 0 API tokens. '
+  + 'So for "open these files" or "read this screenshot", call `subagent(provider="strata", model="qwen3.8-flash-next-iq2_xs")`: ~5.6 s for the first step, then ~1 s per step through the prefix cache. It carries NO verifier, so gate the answer with `verify_task` yourself before using it.\n'
   + '- `subagent` DEFAULTS TO BACKGROUND (`run_in_background: true`): it then returns an id immediately, NOT the answer, and the result arrives later as a separate message. Do NOT poll `job_output` or `job_list` with that id — background jobs are a different mechanism and report `unknown job`. '
   + 'Pass `run_in_background: false` to block and get the result in the tool result instead. A delegated child never sees this guide, so if you delegate a task that itself calls `subagent`, put "pass run_in_background: false" in that task prompt. '
   + 'Measured: the same nested call left unset returned an id and the child burned two steps on `job_output` then `job_list`; with `run_in_background: false` it returned the answer directly.\n'
