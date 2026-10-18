@@ -21,7 +21,7 @@
  *   node scripts/check-docs.mjs --no-selftest  # skip running the suite (fast, for pre-commit)
  *   node scripts/check-docs.mjs --json
  */
-import { readFileSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import { dirname, join, resolve } from 'node:path'
@@ -203,6 +203,33 @@ const HISTORICAL = /(此前|之前|当时|曾经|曾用|历史|旧的|换成|换
   if (problems.length) record('FAIL', 'both READMEs describe the same deployment', problems.join('; '),
     'the English README is a full version, not an archive: regenerate its facts from engine-profile.json')
   else record('PASS', 'both READMEs describe the same deployment', `${zhSize} / ${enSize} chars`)
+}
+
+// ── 7. the generated verifier matrix is the one the code produces ─────────────────────────────
+// docs/verifier-matrix.md is machine-written from the verifier code, so the only thing worth
+// checking is that nobody edited it by hand or left it behind an edit. Rendering it again is cheap
+// (36 in-process checks, one Python spawn) and is the only honest definition of "fresh".
+{
+  const r = spawnSync(process.execPath, [join(REPO, 'scripts', 'verifier-matrix.mjs'), '--md'], {
+    cwd: REPO, encoding: 'utf8', timeout: 180000,
+  })
+  const target = join(REPO, 'docs', 'verifier-matrix.md')
+  if (r.status !== 0) {
+    record('FAIL', 'the verifier matrix runs', (r.stderr || r.stdout || '').trim().split('\n').slice(-3).join(' | '),
+      'node scripts/verifier-matrix.mjs')
+  } else if (!existsSync(target)) {
+    record('FAIL', 'docs/verifier-matrix.md is current', 'the file does not exist',
+      'node scripts/verifier-matrix.mjs --write')
+  } else {
+    const rendered = r.stdout.replace(/\r\n/g, '\n').trim()
+    const onDisk = readFileSync(target, 'utf8').replace(/\r\n/g, '\n').trim()
+    if (rendered !== onDisk) {
+      record('FAIL', 'docs/verifier-matrix.md is current', 'the file differs from a fresh render',
+        'node scripts/verifier-matrix.mjs --write  (it is generated; do not hand-edit)')
+    } else {
+      record('PASS', 'docs/verifier-matrix.md is current', '36 cases, 16 kinds, regenerated identical')
+    }
+  }
 }
 
 // ── verdict ────────────────────────────────────────────────────────────────────────────────────

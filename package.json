@@ -13,6 +13,8 @@
     "test": "node local-delegate.selftest.mjs",
     "doctor": "node scripts/doctor.mjs",
     "check:docs": "node scripts/check-docs.mjs",
+    "matrix": "node scripts/verifier-matrix.mjs",
+    "matrix:write": "node scripts/verifier-matrix.mjs --write",
     "ledger": "node scripts/ledger.mjs",
     "trace": "node scripts/subagent-trace.mjs",
     "sync": "node scripts/sync-install.mjs",

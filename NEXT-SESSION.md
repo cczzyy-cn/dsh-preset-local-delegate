@@ -42,6 +42,7 @@ node scripts/check-docs.mjs          # 文档里的数字 == 实际
 node --check local-delegate.mjs
 node local-delegate.selftest.mjs                       # 233 passed
 node scripts/check-docs.mjs                            # DOCS MATCH THE TREE
+node scripts/verifier-matrix.mjs                       # 36 cases / 16 kinds，全绿
 node scripts/sync-install.mjs --check                  # up to date
 node scripts/doctor.mjs                                # READY
 python tools\build-local-delegate-preset.py --selftest # 3 passed（{{cwd}} 守卫）
@@ -56,7 +57,7 @@ node tools\session-headers.mjs --preset hybrid-router --blank   # 0
 | 现象 | 真相 | 处置 |
 |---|---|---|
 | 改完模块、也 install 了，还没生效 | 模块**每进程加载一次**；pnpm 按 manifest 键控，不看内容 | `sync-install` + **重启 DSH**；用行为探针分辨，不看 GUIDE |
-| `sync-install --check` 说 same，线上却还是旧的 | profile 里的 `cordis.patch.yml` 与源码是**硬链接**（同 inode，`nlink=2`） | 硬链接下"改源码 = 改已装"；**只有重启**能让进程看到 |
+| `sync-install --check` 说 same，线上却还是旧的 | profile 里的 `cordis.patch.yml` 与源码是**硬链接**（同 inode，`nlink=2`） | 现在会单独报 `linked`；`--force-copy` 恢复普通副本，`--link` 主动建链接。**只有重启**能让进程看到 |
 | 委派被拒 `route … is not allowed` | 进程里的 `LOCAL_MODEL` 与 profile 的允许列表不一致 | 换模型 = 引擎 + profile 路由 + module 默认值 + compaction 策略；`engine-profile.json` 是唯一源 |
 | 每个新会话都起不来，且**没有 transcript** | persona 模板引用了未注册的 `{{…}}`（如 `{{cwd}}`） | 生成器会拒绝；`doctor` 也会报 |
 | 委派结果"偷偷被采样" | `<config>.shared-settings.json` 被 Chat 页写入了 temperature | 那个文件只留 `reasoning_effort` |
@@ -67,7 +68,8 @@ node tools\session-headers.mjs --preset hybrid-router --blank   # 0
 
 - `tools/` —— 生成与取证（10 个文件）：generator / dumper / validator / roster / asar-read / `session-*` / vision-check。
   **都从仓库根跑**，不再 `cd ..`。
-- `scripts/` —— 运行时运维：`doctor` / `check-docs` / `ledger` / `sync-install` / `subagent-trace`。
+- `scripts/` —— 运行时运维：`doctor` / `check-docs` / `verifier-matrix` / `ledger` / `sync-install` / `subagent-trace`。
+- `docs/verifier-matrix.md` —— **生成物**（`npm run matrix:write`）：16 个 kind 的阳性/近失矩阵；`check-docs` 会验它是否过期。
 - `engine-profile.json` —— 唯一引擎事实源；**换模型只改这里 + profile patch**，然后 `check-docs`。
 - `HISTORY.md` —— 历史。追某个结论的出处时去那里，不要用它的数字验收今天。
 - 父仓库 `git/Strata/tools/` 里还剩 `conversation_growth_needle.py` 等**引擎侧**工具仍未入库；

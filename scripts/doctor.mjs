@@ -103,19 +103,25 @@ if (drifted.length) {
   record('PASS', 'installed copy matches the checkout', `${FILES.length} files, sha256 identical`)
 }
 
-// A hard link means "editing the source edits the installed preset" — worth saying out loud,
-// because sync-install can then never report that file stale.
-for (const f of ['cordis.patch.yml', 'local-delegate.mjs']) {
-  const a = join(REPO, f)
-  const b = join(INSTALLED, f)
-  if (!existsSync(a) || !existsSync(b)) continue
-  const sa = statSync(a)
-  const sb = statSync(b)
-  if (sa.ino === sb.ino && sa.dev === sb.dev) {
-    record('WARN', `${f} is a hard link to the checkout`,
-      `nlink=${sa.nlink}, same inode — the source and the "installed" copy are one file`,
-      'nothing to do if that is intended; a copyFileSync would silently break the link')
-    break
+// A hard link means "editing the source edits the installed preset" — the install step is not a
+// moment, and `sync-install` will (correctly) never report that file stale. Worth saying out loud,
+// because the usual reading of "up to date" is "nothing I do here reaches the profile".
+{
+  const linked = []
+  for (const f of FILES) {
+    const a = join(REPO, f)
+    const b = join(INSTALLED, f)
+    if (!existsSync(a) || !existsSync(b)) continue
+    const sa = statSync(a)
+    const sb = statSync(b)
+    if (sa.ino === sb.ino && sa.dev === sb.dev) linked.push(f)
+  }
+  if (linked.length) {
+    record('WARN', 'hard links between the checkout and the installed copy',
+      `${linked.join(', ')} — nlink=${statSync(join(REPO, linked[0])).nlink}, the source IS the installed file`,
+      'expected when `sync-install --link` was used; otherwise `sync-install --force-copy` restores plain copies')
+  } else {
+    record('PASS', 'no hard link between the checkout and the installed copy', `${FILES.length} plain files`)
   }
 }
 

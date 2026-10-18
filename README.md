@@ -315,7 +315,7 @@ node local-delegate.selftest.mjs                          # 期望 233 passed, 0
 node scripts/check-docs.mjs                               # 期望 DOCS MATCH THE TREE（文档里的数字 == 实际）
 node scripts/sync-install.mjs --check                     # 期望 up to date
 node scripts/doctor.mjs                                   # 期望 READY（引擎没起时 FAIL 是对的）
-python tools\build-local-delegate-preset.py --selftest    # 生成器的守卫自检：期望 3 passed
+python tools\build-local-delegate-preset.py --selftest    # 生成器的守卫自检：期望 4 passed
 python tools\build-local-delegate-preset.py --check       # cordis.patch.yml 是否与源码一致
 python tools\validate-preset-bundle.py .                  # 期望 valid
 python tools\check-profile-roster.py                      # 期望 OK: 5 presets
@@ -332,6 +332,7 @@ node   tools\session-headers.mjs --preset hybrid-router --blank   # 期望 0
 |---|---|
 | `scripts/doctor.mjs` | **一条命令回答"现在能用吗"**：进程是否比配置旧（＝要重启 DSH）、硬链接、引擎 `health`/`settings`、模型 id 四处是否一致、preset 组合与死变量、死路由会话（`--deep`）。只读，不改任何东西 |
 | `scripts/check-docs.mjs` | 断言文档数字 == 实际（用例数、模块指纹/字节、模型 id、`maxTokens`/`contextWindow`、引擎版本）。只断言，不代写叙述 |
+| `scripts/verifier-matrix.mjs` | **校验器质量矩阵**：16 个 kind × 一个必须通过的载荷 + 至少一个必须被拒的**近失**（类型对值错、值对序错、引文在第 9 行）。产出 `docs/verifier-matrix.md`（生成物），只有"每个 kind 都既有阳性又有近失"才算通过 |
 | `scripts/ledger.mjs` | 汇总 `~/.dsh/local-delegate-ledger.jsonl`（每次 `delegate_batch` 写一行）：批次数、PASS 率、本地 token、按天/按 kind/按 cwd。`DSH_LOCAL_LEDGER=0` 关账本 |
 | `scripts/sync-install.mjs` | 同步进 profile 的 pnpm 副本（`--check` 只报） |
 | `scripts/subagent-trace.mjs` | 读任意会话/子代理的 zstd 记录，打印时间线（`--last`/`--watch`/`--raw`/`--json`） |
@@ -361,7 +362,10 @@ unknown prompt variable "{{cwd}}" in section "deployment:persona-suffix"; regist
   新建会话照样失败。2026-10-18 那次的进程起于 14:20:16，文件修于 14:23:14——这两个时间点看起来就像"修了没用"。
 - **profile 里这份 bundle 是指向源码目录的硬链接**（`nlink = 2`，2026-10-18 核实），所以改源码会**同时**改掉
   已安装的预设，`sync-install --check` 对那个文件永远不会报 stale。方便，但如果你以为"install 那一步才让文件变"，
-  它就是个陷阱。
+  它就是个陷阱。`sync-install` 现在会把它单独报成 **`linked`**（不是 `copied`、也不是 `same`）；要恢复成普通副本用
+  `--force-copy`，要主动建链接用 `--link`。
+- **测试链路本身是自检的**：`scripts/verifier-matrix.mjs` 让 16 个 kind 各跑一个"必须通过"的载荷和一个"必须被拒"的
+  近失；`docs/verifier-matrix.md` 是它的生成物，`check-docs` 会在它过期时失败。
 
 ---
 
@@ -373,7 +377,8 @@ unknown prompt variable "{{cwd}}" in section "deployment:persona-suffix"; regist
 | `engine-profile.json` | **引擎事实的唯一来源**：模型 id、窗口、`maxTokens`、推理档位、采样、能力标志。生成器读它，`doctor`/`check-docs` 用它断言其余四处 |
 | `local-delegate.mjs` | 唯一增量：16 个校验器、`delegate_batch`（文本 / `files` / 图像 / 账本）、GUIDE 与 CHILD_GUIDE |
 | `local-delegate.selftest.mjs` | 233 个确定性用例（每条都钉一个行为或一个曾经的缺陷） |
-| `scripts/` | 运行时运维：`doctor`/`check-docs`/`ledger`/`sync-install`/`subagent-trace`（**不在安装副本白名单里**，从源码目录用） |
+| `scripts/` | 运行时运维：`doctor`/`check-docs`/`verifier-matrix`/`ledger`/`sync-install`/`subagent-trace`（**不在安装副本白名单里**，从源码目录用） |
+| `docs/verifier-matrix.md` | **生成物**：16 个 kind 的"阳性 / 近失"矩阵，由 `scripts/verifier-matrix.mjs --write` 生成，手改会被 `check-docs` 抓住 |
 | `tools/` | 生成、校验、取证：`build-local-delegate-preset`/`dump-shipped-preset`/`validate-preset-bundle`/`check-profile-roster`/`asar-read`/`session-*`（2026-10-18 从隔壁仓库收进来并入库） |
 | `README.md` | **中文主说明**（本文件） |
 | `README.en.md` | 英文完整版（含全部测量出处） |

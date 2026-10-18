@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -141,44 +142,70 @@ COMPACTION_CONFIG = """\
 """
 
 
-# Prompt variables this build's loop registers for a persona TEMPLATE. `prefix` and `suffix` are not
-# plain text: the persona row hands them to the prompt registry, which resolves every complete
-# `{{...}}` group STRICTLY, and an unknown name fails prompt ASSEMBLY — before any model request, so
-# every session on the preset dies with no transcript of its own. Measured 2026-10-18 on the desktop
+# Prompt variables this build registers for a persona TEMPLATE. `prefix` and `suffix` are not plain
+# text: the persona row hands them to the prompt registry, which resolves every complete `{{...}}`
+# group STRICTLY, and an unknown name fails prompt ASSEMBLY — before any model request, so every
+# session on the preset dies with no transcript of its own. Measured 2026-10-18 on the desktop
 # 0.2.0-rc.2 build, after the `standard` preset's old suffix came along with the base list verbatim:
 #
 #   unknown prompt variable "{{cwd}}" in section "deployment:persona-suffix";
 #   registered variables: provider, model
 #
-# `cwd` is a leftover that the old shipped preset carried as `suffix: Your working directory is
-# {{cwd}}.`. The current build dropped it because the working directory now arrives as literal user
-# context (the working-directory service), not as a template variable — so the clause is both
-# unrenderable and redundant. Extending this set is only correct after checking the running build's
-# own registry: `tools/asar-read.py --grep 'registered variables'`.
-REGISTERED_PROMPT_VARIABLES = frozenset({"provider", "model"})
+# `cwd` was a leftover from the old shipped preset (`suffix: Your working directory is {{cwd}}.`).
+# The working directory now arrives as literal user context from the working-directory service, so
+# the variable does not exist and the clause is both unrenderable and redundant.
+#
+# The set is READ OUT OF THE RUNNING BUILD rather than hardcoded, because a hardcoded set is a
+# snapshot of one build's answer: a plugin can register more, and a later build can register fewer.
+# What the extraction looks for is the loop's own registration — the build contains
+#
+#   ctx.systemPrompt.variable("provider", (context) => context.agent?.options.provider);
+#   ctx.systemPrompt.variable("model", (context) => context.agent?.options.model);
+#
+# Note the DOUBLE quotes: the same build's *documentation* shows the API with single quotes
+# (`ctx.systemPrompt.variable('response_language', ...)`), which is prose, not a registration. The
+# quote style is what separates the two, so a future build that minifies to single quotes makes this
+# find nothing — and finding nothing is a loud failure, not a silently empty set.
+REGISTRATION_RE = re.compile(r'systemPrompt\.variable\(\s*"([A-Za-z0-9_.:-]+)"')
+FALLBACK_REGISTERED = frozenset({"provider", "model"})
 
 
-def check_prompt_variables(patch: str) -> list[str]:
+def registered_prompt_variables(asar_path: Path) -> frozenset[str]:
+    """The prompt variables this build's loop registers, read out of its own bundle."""
+    try:
+        text = Path(asar_path).read_bytes().decode("utf-8", "replace")
+    except OSError as e:
+        raise SystemExit(f"cannot read the harness bundle at {asar_path}: {e}\n"
+                         f"  pass --asar, or install the desktop app where DEFAULT_ASAR points")
+    names = frozenset(REGISTRATION_RE.findall(text))
+    if not names:
+        raise SystemExit(
+            "found no `systemPrompt.variable(\"...\")` registration in the bundle, so the set of "
+            "prompt variables a persona template may use is unknown. Refusing to guess: guessing "
+            "either rejects a live variable or blesses a dead one (the {{cwd}} failure). Update "
+            "REGISTRATION_RE for this build, or pass a bundle that still registers variables.")
+    return names
+
+
+def check_prompt_variables(patch: str, registered: frozenset[str]) -> list[str]:
     """Every `{{var}}` the patch emits must be one the persona registry can resolve.
 
     The base list is copied verbatim, so a shipped preset that still carries a dead variable would
     be reproduced silently; this turns that into a build failure that names the line and the rule.
     """
-    import re
-
     problems: list[str] = []
-    registered = ", ".join(sorted(REGISTERED_PROMPT_VARIABLES))
+    known = ", ".join(sorted(registered))
     for m in re.finditer(r"\{\{\s*([A-Za-z0-9_.:-]+)\s*\}\}", patch):
         name = m.group(1)
-        if name in REGISTERED_PROMPT_VARIABLES:
+        if name in registered:
             continue
         line_no = patch.count("\n", 0, m.start()) + 1
         problems.append(
             f"line {line_no}: the patch interpolates {{{{ {name} }}}}, which this build does not "
-            f"register for persona templates (registered: {registered}). Prompt assembly fails "
+            f"register for persona templates (registered: {known}). Prompt assembly fails "
             f"before any model request — measured 2026-10-18: \"unknown prompt variable\" in "
             f"section \"deployment:persona-suffix\". Drop the clause, or extend "
-            f"REGISTERED_PROMPT_VARIABLES after checking the running build's own registry."
+            f"REGISTRATION_RE if this build registers the variable another way."
         )
     return problems
 
@@ -268,32 +295,51 @@ def self_check(patch: str) -> list[str]:
 
 
 def self_test() -> int:
-    """Pin the dead-variable guard: a `{{cwd}}` suffix must be rejected, a clean patch accepted.
+    """Pin the dead-variable guard AND the extraction that feeds it.
 
     Measured 2026-10-18: the guard is what stands between a shipped-preset leftover and every
-    session on this preset failing prompt assembly, so it gets its own case rather than being
-    trusted. Run with `--selftest`.
+    session on this preset failing prompt assembly, so it gets its own cases rather than being
+    trusted. The extraction matters just as much — a guard fed an empty set rejects everything, and
+    one fed a set scraped from prose blesses a dead variable. Run with `--selftest`.
     """
+    registered = FALLBACK_REGISTERED
     dead = ("              prefix: You are a coding agent powered by the {{model}} model.\n"
             "              suffix: Your working directory is {{cwd}}.\n")
     live = "              prefix: You are a coding agent powered by the {{model}} model.\n"
 
+    # The extraction sees the CODE registration and ignores the DOC example, which differs only in
+    # its quote style. Both lines are copied from the 0.2.0-rc.2 bundle.
+    bundle_sample = (
+        'ctx.effect(() => ctx.agents.setFactory(this), "agentLoop.setFactory()"); '
+        'ctx.systemPrompt.variable("provider", (context) => context.agent?.options.provider); '
+        'ctx.systemPrompt.variable("model", (context) => context.agent?.options.model);\n'
+        "```text\nctx.systemPrompt.variable('response_language', () => 'English')\n```\n")
+    extracted = frozenset(REGISTRATION_RE.findall(bundle_sample))
+
     failures: list[str] = []
-    rejected = check_prompt_variables(dead)
+    if extracted != FALLBACK_REGISTERED:
+        failures.append(f"extraction from the bundle sample gave {sorted(extracted)}, "
+                        f"expected {sorted(FALLBACK_REGISTERED)} (the doc example must not count)")
+    rejected = check_prompt_variables(dead, registered)
     if len(rejected) != 1 or "cwd" not in rejected[0]:
         failures.append(f"a {{cwd}} suffix was not rejected exactly once: {rejected!r}")
-    if check_prompt_variables(live):
+    if check_prompt_variables(live, registered):
         failures.append(f"a patch with only {{{{model}}}} was rejected: "
-                        f"{check_prompt_variables(live)!r}")
-    if check_prompt_variables("{{provider}} and {{model}} are fine"):
+                        f"{check_prompt_variables(live, registered)!r}")
+    if check_prompt_variables("{{provider}} and {{model}} are fine", registered):
         failures.append("the two registered variables were rejected")
+    # The set is the authority: a variable that IS registered must pass even though it is new.
+    if check_prompt_variables("{{response_language}}", frozenset({"provider", "model", "response_language"})):
+        failures.append("a registered variable was rejected because it was not hardcoded")
     if failures:
         for f in failures:
             print(f"  FAIL  {f}", file=sys.stderr)
         return 1
+    print("ok   the extraction reads registrations and ignores the doc example")
     print("ok   a {{cwd}} persona suffix is rejected, naming the variable")
     print("ok   {{provider}} and {{model}} pass")
-    print("\n3 passed, 0 failed")
+    print("ok   the registered set is authoritative, not a hardcoded pair")
+    print("\n4 passed, 0 failed")
     return 0
 
 
@@ -320,7 +366,11 @@ def main() -> int:
             print(f"  !! {p}", file=sys.stderr)
         raise SystemExit("refusing to write a structurally invalid patch (see above)")
 
-    unresolved = check_prompt_variables(patch)
+    # The allowed set comes from the build being targeted, not from a constant: a hardcoded pair
+    # goes stale the moment a plugin registers a variable or the build drops one.
+    dumper = load_dumper()
+    understood = registered_prompt_variables(a.asar or dumper.DEFAULT_ASAR)
+    unresolved = check_prompt_variables(patch, understood)
     if unresolved:
         for p in unresolved:
             print(f"  !! {p}", file=sys.stderr)
