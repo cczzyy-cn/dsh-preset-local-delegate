@@ -39,7 +39,7 @@ to text: a vision answer with no checker is not delegable either.
 > a dependency by its **manifest**, not by its contents — so after editing `local-delegate.mjs` a
 > re-install prints *"Already up to date"* while the harness keeps running the **old module**.
 > Measured 2026-10-13: that cost a long debugging session in which every delegation was refused
-> with `route "strata/qwen3.8-flash-next-iq2_xs" is not allowed`, because the live copy still held
+> with `route "strata/qwen3.8-flash-next-iq2_xs" is not allowed` (2026-10-13), because the live copy still held
 > the deleted model id as `LOCAL_MODEL`. **Reproduced verbatim 2026-10-15**, during the IQ2_XS → IQ3_S
 > swap: the new config was live and the engine answered `/v1/models` with `iq3_s` only, while the
 > loaded module still asked for `iq2_xs` — every delegation was refused (`delegate_batch` reported
@@ -55,6 +55,21 @@ to text: a vision answer with no checker is not delegable either.
 >
 > **Then restart DSH itself** — a new session inside the same process keeps the old module
 > instance (measured 2026-10-02), so "I opened a new session" is not a restart.
+
+## State of this deployment
+
+Every fact below also lives in `engine-profile.json` (the single source the generator, `doctor` and
+`check-docs` read), and `node scripts/check-docs.mjs` fails when the two disagree.
+
+| fact | value | how to confirm |
+|---|---|---|
+| engine | Strata **0.1.44.1**, `max_context` **262144**, `images: true` | `curl http://127.0.0.1:8080/health` |
+| model | **qwen3.8-flash-next-iq3_xxs** (~3-bit general model; replaced IQ3_S on 2026-10-16 and freed 6.9 GiB) | same `/health` |
+| reasoning effort | **`low`** at the engine (shared default) — at `none` multi-step arithmetic is silently wrong | `GET /settings` |
+| sampling | **greedy (temperature 0)**, and `<config>.shared-settings.json` must add none | `GET /settings` → `{"defaults":{"reasoning_effort":"low"}}` |
+| module fingerprint | `F145FC63F896DE15` (126,572 B) | `Get-FileHash local-delegate.mjs` |
+| self-test | **233** deterministic cases, 0 failed | `node local-delegate.selftest.mjs` |
+| toolchain | `tools/` **inside this repository** (moved here 2026-10-18; it used to live in the sibling checkout, untracked) | `git ls-files tools` |
 
 ## What it adds
 
@@ -303,7 +318,7 @@ http(s) URL, or a bare local path), and the engine advertises it:
 
 ```
 GET /v1/models → architecture.input_modalities = ["text", "image"]
-GET /health    → {"status":"ok","model":"qwen3.8-flash-next-iq3_s","images":true,"loaded":true}
+GET /health    → {"status":"ok","model":"qwen3.8-flash-next-iq3_xxs","images":true,"loaded":true}
 ```
 
 So the capability was always there — the delegation layer just had no way to carry a picture.
@@ -450,7 +465,7 @@ generated tokens means **the thinking channel is on by default**.
 `delegate_batch` therefore sends:
 
 ```js
-{ agentOptions: { provider: 'strata', model: 'qwen3.8-flash-next-iq3_s', maxTokens: 4096 },
+{ agentOptions: { provider: 'strata', model: 'qwen3.8-flash-next-iq3_xxs', maxTokens: 4096 },
   toolFilter: { allow: [] },          // the local model has no tool loop: schemas are pure overhead
   persona: '<a two-line tool-model persona>' }
 ```
@@ -485,7 +500,7 @@ config said so. The IQ3_S file is `{"reasoning_effort": "low"}` and nothing else
 path is on the greedy configuration again.
 
 **Thinking now runs at `low` at the engine for this deployment** (`POST /settings {"defaults":
-{"reasoning_effort":"low"}}`, persisted to `strata-iq3_s.shared-settings.json`), because the
+{"reasoning_effort":"low"}}`, persisted to the engine's `<config>.shared-settings.json`), because the
 engine's shared defaults fill in only where a request carries none of its own (`serve/server.py:759`)
 and the harness sends none. This replaced an earlier `none`. Measured on this machine, 2026-10-13, on
 the model this deployment ran then (`qwen3.8-flash-next-iq2_xs`) and **re-measured unchanged
@@ -537,10 +552,10 @@ ordering is fine either way.
 
 | fact | how |
 |---|---|
-| `strata/qwen3.8-flash-next-iq3_s` is a live route | `list_subagent_models provider=strata`; the route check reads the provider row's model list, so a swap is not complete until DSH restarts |
+| `strata/qwen3.8-flash-next-iq3_xxs` is a live route | `list_subagent_models provider=strata`; the route check reads the provider row's model list, so a swap is not complete until DSH restarts |
 | a delegated task round-trips correctly | sent a 3-line extraction; got `["alpha","delta","zeta"]` |
 | **no reasoning effort may be sent** — the provider rejects one it does not advertise | `subagent(provider=strata, reasoning_effort='none')` → `provider "strata" model "…" does not support reasoning effort "none"`, before any request is sent |
-| the engine is up and greedy | `GET /health` → `{"status":"ok","model":"qwen3.8-flash-next-iq3_s","loaded":true}`; `GET /settings` → `{"shared":true,"defaults":{"reasoning_effort":"low"}}` — no temperature, which is what keeps it greedy |
+| the engine is up and greedy | `GET /health` → `{"status":"ok","model":"qwen3.8-flash-next-iq3_xxs","loaded":true}`; `GET /settings` → `{"shared":true,"defaults":{"reasoning_effort":"low"}}` — no temperature, which is what keeps it greedy |
 | the attachment store takes encoded **bytes**, not base64 | in `app.asar`: `SaveImageAttachment { data: Uint8Array; … }`, `probeImage` → `sharp(data)`, and the wire adapter `saveInput` does `decodeBase64(image.data)` |
 | a preset module instance is loaded **once per DSH process** | DSH started `18:12:02`, the module was rewritten `18:16:32`, a session opened `18:26` still reported the old `retries` default (`attempts=2`); see *Installing and editing* |
 | what a delegated child can actually reach | its own transcript: `list_subagent_models` works, `subagent` exists but is always refused (`depth 2 exceeds maxDepth 1`), `workflow` is `unknown tool` (3 attempts, nothing written) |
@@ -563,7 +578,7 @@ the field rather than failing, so the engine's shared default decides the effort
        providers:
          strata:
            models:
-             - id: qwen3.8-flash-next-iq3_s
+             - id: qwen3.8-flash-next-iq3_xxs
                reasoningEfforts:
                  off: none
                  low: low
@@ -575,7 +590,7 @@ the field rather than failing, so the engine's shared default decides the effort
 | Variable | Default | Effect |
 |---|---|---|
 | `DSH_LOCAL_PROVIDER` | `strata` | provider route for the delegated child |
-| `DSH_LOCAL_MODEL` | `qwen3.8-flash-next-iq3_s` | model id |
+| `DSH_LOCAL_MODEL` | `qwen3.8-flash-next-iq3_xxs` | model id |
 | `DSH_LOCAL_REASONING_EFFORT` | *(empty)* | per-call effort; empty omits the field (see above) |
 | `DSH_LOCAL_STRIP_TOOLS` | `1` | `0` keeps the child's inherited tool surface |
 | `DSH_LOCAL_CHILD_PERSONA` | a two-line tool-model persona | shadows the child's `deployment:persona-prefix` |
@@ -597,14 +612,21 @@ refused batch is reported per task rather than thrown.
 |---|---|
 | `cordis.patch.yml` | **Generated.** The preset declaration: the shipped `standard` plugin list verbatim, then the one added row |
 | `local-delegate.mjs` | The added capability: verifiers, `delegate_batch` (text + `files` + images, with a per-batch local-token ledger), the routing guide for the top-level agent, and the short child notes for a delegated child |
-| `local-delegate.selftest.mjs` | 195 deterministic cases, each pinning a behaviour or a defect; mutations of the module (a kind dropped from the table, the positive-acceptance half of `prove` reverted, the payload never persisted, `citation` back to single-line, `wholeWord` dropped, boundaries tested on squashed text, the child predicate disabled, the section back to a plain string, the stop reason ignored, the batch footer dropped) are each caught by the case meant to catch them |
+| `local-delegate.selftest.mjs` | 233 deterministic cases, each pinning a behaviour or a defect; mutations of the module (a kind dropped from the table, the positive-acceptance half of `prove` reverted, the payload never persisted, `citation` back to single-line, `wholeWord` dropped, boundaries tested on squashed text, the child predicate disabled, the section back to a plain string, the stop reason ignored, the batch footer dropped) are each caught by the case meant to catch them |
 | `package.json` | Bundle manifest: `dsh.bundle.patch`, and the `exports` map the module subpath resolves through |
+| `engine-profile.json` | **Single source for the engine facts**: model id, context window, `maxTokens`, reasoning effort, sampling, capability flags. The generator reads it; `doctor` and `check-docs` assert the other four copies against it |
+| `scripts/doctor.mjs` | One read-only command that answers "will delegation work right now?" — process vs. file mtimes (i.e. "restart DSH"), hard links, engine `/health` and `/settings`, the four copies of the model id, the preset composition and dead prompt variables, dead local routes (`--deep`) |
+| `scripts/check-docs.mjs` | Asserts that the numbers the docs state are the numbers that are true (self-test count, module fingerprint and size, model id, `maxTokens`/`contextWindow`, engine version). It never rewrites prose |
+| `scripts/ledger.mjs` | Sums `~/.dsh/local-delegate-ledger.jsonl`, which `delegate_batch` appends to once per batch: batches, PASS rate, local tokens, by day / by verifier kind / by cwd. `DSH_LOCAL_LEDGER=0` turns the ledger off |
 | `scripts/subagent-trace.mjs` | Reads any session's or child's `session.v4.jsonl.zstd` — walking **every** appended frame, since `zstdDecompressSync` decodes only the first — and prints a timeline or the raw JSONL (`--last`, `--watch`, `--raw`, `--json`). Not copied by `sync-install.mjs`; run it from this directory |
 | `scripts/sync-install.mjs` | Copies this tree into the profile's pnpm copy (pnpm will not re-copy a changed non-manifest file) |
-| `../../tools/build-local-delegate-preset.py` | Regenerates `cordis.patch.yml` from this build's own app.asar |
-| `../../tools/dump-shipped-preset.py` | Prints a shipped preset's plugin list, for diffing |
-| `../../tools/validate-preset-bundle.py` | Pre-install check: every package exists in this build, every local module resolves and is in `exports` |
-| `../../tools/vision-check.py` | Standalone bridge: ask a running Strata engine about an image and get a machine verdict. Useful for probing the engine without a harness session |
+| `tools/build-local-delegate-preset.py` | Regenerates `cordis.patch.yml` from this build's own app.asar. Refuses a dead `{{…}}` prompt variable; `--selftest` pins that refusal |
+| `tools/dump-shipped-preset.py` | Prints a shipped preset's plugin list, for diffing |
+| `tools/validate-preset-bundle.py` | Pre-install check: every package exists in this build, every local module resolves and is in `exports` |
+| `tools/check-profile-roster.py` | Composes the profile's patch stack from disk + the running build and reports the preset roster and effective default |
+| `tools/session-*.mjs` | Session forensics, read-only unless `--write`: `headers` (which preset each session is pinned to), `route-policy` (dead local routes), `dump` (every appended frame), `set-preset` (repoint one session's first frame, dry-run by default) |
+| `tools/asar-read.py` | Reads the running `app.asar` directly (`--find`/`--grep`/`--cat`) — every harness-internal claim is taken from here |
+| `tools/vision-check.py` | Standalone bridge: ask a running Strata engine about an image and get a machine verdict. Useful for probing the engine without a harness session |
 
 ## Running the self-test
 
@@ -612,7 +634,12 @@ refused batch is reported per task rather than thrown.
 node local-delegate.selftest.mjs
 ```
 
-195 cases: fence tolerance, a malformed schema that must not pass everything,
+Runs offline by default: the suite probes the engine once, and when none answers it bypasses the
+delegation preflight and prints a line saying so — every generation in the suite goes to a fake
+provider, so no case actually needs the engine. `DSH_REQUIRE_ENGINE=1` restores the fail-fast
+behaviour for a run that must prove it had a live engine behind it.
+
+233 cases: fence tolerance, a malformed schema that must not pass everything,
 `additionalProperties:false` and `minLength` enforced, integer vs number, a looping answer
 reported as repetition rather than as malformed JSON, an empty answer blamed on the engine, the
 gate never throwing on wrong-typed payloads, the `def`-extraction bug above, the exact
@@ -710,11 +737,20 @@ DSH itself, not just the session, and tell them apart with behaviour rather than
 > means this process loaded the current file; `attempts=2 · 1 retried` means it did not. Cost: one
 > or two ~0.3 s local generations.
 
-Before installing, run the two checks:
+Before installing, run the two checks (both from this repository — the toolchain lives in `tools/`,
+so there is no `cd ..` any more):
 
 ```powershell
 python tools/build-local-delegate-preset.py --check
-python tools/validate-preset-bundle.py dsh-preset-local-delegate
+python tools/validate-preset-bundle.py .
+```
+
+And after any change — to the module, the profile, the model or the docs — one command answers
+whether the deployment is actually usable right now:
+
+```powershell
+node scripts/doctor.mjs        # READY, or a FAIL with the next action on each line
+node scripts/check-docs.mjs    # does the documentation still state true numbers?
 ```
 
 `cordis.patch.yml` is generated from this build's app.asar. After a harness upgrade, regenerate

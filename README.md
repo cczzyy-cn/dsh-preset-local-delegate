@@ -42,7 +42,7 @@
 
 ## 一、它解决什么问题
 
-本地引擎（本机 Strata，`qwen3.8-flash-next-iq3_s`）免费但**不可靠**：同一个 prompt 发三次可能两次对、一次烧满 120 秒预算。
+本地引擎（本机 Strata，`qwen3.8-flash-next-iq3_xxs`）免费但**不可靠**：同一个 prompt 发三次可能两次对、一次烧满 120 秒预算。
 API token 贵但可靠。于是关键判断不是"这个任务看起来简单吗"，而是：
 
 > **我能不能为这个答案写出一个确定性校验器？**
@@ -63,11 +63,11 @@ API token 贵但可靠。于是关键判断不是"这个任务看起来简单吗
 | 模型 | **qwen3.8-flash-next-iq3_xxs**（约 3-bit 通用；2026-10-16 从 IQ3_S 换过来，内存少 6.9 GiB） | `curl http://127.0.0.1:8080/health` |
 | 引擎窗口 / 图像 | `max_context` **262144**（模型训练长度；2026-10-15 曾降到 131072 省内存，同日按用户要求调回）、`images: true` | `curl http://127.0.0.1:8080/health` |
 | 推理档位 | **`low`**（引擎 shared 默认）——**不要调回 `none`**（IQ3_XXS 上推理组 `none` 9/18、`low` 18/18） | `GET /settings`；而正确性证据见 §九 |
-| DSH 路由 | `strata/qwen3.8-flash-next-iq3_xxs`，`contextWindow 262144` / `maxTokens 65536`（**两处必须与引擎的 `max_context` 对齐**；提示词硬上限 = 窗口 − maxTokens = 196608） | `list_subagent_models provider=strata` + profile patch |
+| DSH 路由 | `strata/qwen3.8-flash-next-iq3_xxs`，`contextWindow 262144` / `maxTokens 32768`（**两处必须与引擎的 `max_context` 对齐**；提示词硬上限 = 窗口 − maxTokens = 196608） | `list_subagent_models provider=strata` + profile patch |
 | 内存余量 | 262144 下：IQ3_XXS 的 `arena_mib` = **40925 MiB（39.97 GiB）**、KV pinned 3.09 GiB、物理可用 **10.9 GB**、commit 余 14.2 GB；IQ3_S 同样上下文是 arena 47962 MiB、物理可用 **0.7 GB**、commit 余 5.4–8.1 GiB（换小量化是**唯一幅度够大的降内存手段**，省下的是 6.9 GiB）。**显存**：两者加载后都偏紧（IQ3_XXS 174 MiB、IQ3_S 73 MiB），引擎建议 `--vram-reserve-mib 1038`/`1139` | `Win32_PerfFormattedData_PerfOS_Memory` 的 CommittedBytes、引擎日志 `memory guard` / `VRAM free` |
-| 自检 | **229 passed, 0 failed** | `node local-delegate.selftest.mjs` |
+| 自检 | **233 passed, 0 failed** | `node local-delegate.selftest.mjs` |
 | 可靠上下文 | IQ2_XS 时代实测 **≤ 142K**（145K 不稳定、231K 必失败，见 §八）；**IQ3_S 上 257,742 token 三个深度 3/3 全对**（2026-10-15，只测了一个长度，待重扫） | 实测 |
-| 模块指纹 | `local-delegate.mjs` `BAC60126866B4D9C`（123,872 B，2026-10-16 换 IQ3_XXS 后） | `Get-FileHash` / `sha256sum` |
+| 模块指纹 | `local-delegate.mjs` `F145FC63F896DE15`（126,572 B，2026-10-18 加账本后） | `Get-FileHash` / `sha256sum` |
 
 ---
 
@@ -76,7 +76,7 @@ API token 贵但可靠。于是关键判断不是"这个任务看起来简单吗
 ```bash
 node scripts/sync-install.mjs          # 或 npm run sync
 node scripts/sync-install.mjs --check  # 只检查，不改
-node local-delegate.selftest.mjs       # 229 个确定性用例
+node local-delegate.selftest.mjs       # 233 个确定性用例
 ```
 
 `sync-install` 把这些文件复制进 `$DSH_HOME/profiles/desktop/node_modules/dsh-preset-local-delegate/`：
@@ -276,7 +276,7 @@ node local-delegate.selftest.mjs       # 229 个确定性用例
 | 单次墙钟预算 | `DSH_DELEGATE_TIMEOUT_MS`，默认 **120 s**（可用任务级 `timeoutMs` 覆盖）；超时即 `aborted`、**不重试** |
 | 重试 | 默认 **0**——10 次同形状观察里盲重发从未救回（且引擎**非确定性**，重发是**另一个样本**，不是重放） |
 | 输入规模 | `delegate_batch` 建议 **< 40 行 / 4K 字符**内联；更大的任务**用 `files:` 或切开**（实测 47 行抽取会退化成逐字复读） |
-| 输出上限 | `maxTokens 131072`（profile）/ `DSH_LOCAL_MAX_TOKENS` 4096（单次生成）——形状是**输入可以很大、输出要小** |
+| 输出上限 | `maxTokens 32768`（profile）/ `DSH_LOCAL_MAX_TOKENS` 4096（单次生成）——形状是**输入可以很大、输出要小** |
 | 容量**不可查询** | `list_subagent_models` **只给名字**。真实窗口看引擎 `GET /health` 的 `max_context`；**引擎从不截断**，`prompt + maxTokens` 超窗口直接 400 `CONTEXT_WINDOW_EXCEEDED` |
 | 可靠上下文 | **≤ 142K token**；越界后不是"找不到"，而是**指令跟随整体崩塌**（还会撞满 max_tokens）。**委派 prompt 控制在 128K 以内** |
 | 图像 | `images: ["<绝对路径>"]`；640×480 ≈ 330 token、1280×960 ≈ 1002。**引擎只读不画**，没给它的它看不见 |
@@ -311,17 +311,28 @@ node local-delegate.selftest.mjs       # 229 个确定性用例
 ```powershell
 cd <此仓库>
 node --check local-delegate.mjs
-node local-delegate.selftest.mjs                     # 期望 229 passed, 0 failed
-node scripts/sync-install.mjs --check                # 期望 up to date
-cd ..
-python tools\build-local-delegate-preset.py --check  # cordis.patch.yml 是否与源码一致
-python tools\validate-preset-bundle.py dsh-preset-local-delegate
-python tools\check-profile-roster.py                 # 期望 OK: 5 presets
+node local-delegate.selftest.mjs                          # 期望 233 passed, 0 failed（没引擎也能跑，见下）
+node scripts/check-docs.mjs                               # 期望 DOCS MATCH THE TREE（文档里的数字 == 实际）
+node scripts/sync-install.mjs --check                     # 期望 up to date
+node scripts/doctor.mjs                                   # 期望 READY（引擎没起时 FAIL 是对的）
+python tools\build-local-delegate-preset.py --selftest    # 生成器的守卫自检：期望 3 passed
+python tools\build-local-delegate-preset.py --check       # cordis.patch.yml 是否与源码一致
+python tools\validate-preset-bundle.py .                  # 期望 valid
+python tools\check-profile-roster.py                      # 期望 OK: 5 presets
 node   tools\session-headers.mjs --preset hybrid-router --blank   # 期望 0
 ```
 
+> 工具链已经**收进本仓库** `tools/`（2026-10-18），所以在仓库根直接跑，不再需要 `cd ..`：
+> 之前它们在隔壁 `tools/` 且**从未入库**，一次 `git clean -xd` 就会把"能重新生成、能重新验证"这件事一起删掉。
+>
+> **`npm test` 默认离线可跑**：套件先探一次引擎，探不到就绕过委派前置检查并打印一行说明（所有生成都走假 provider，
+> 没有用例真的需要引擎）。要强制"必须对着活引擎跑"，设 `DSH_REQUIRE_ENGINE=1`。
+
 | 工具 | 用途 |
 |---|---|
+| `scripts/doctor.mjs` | **一条命令回答"现在能用吗"**：进程是否比配置旧（＝要重启 DSH）、硬链接、引擎 `health`/`settings`、模型 id 四处是否一致、preset 组合与死变量、死路由会话（`--deep`）。只读，不改任何东西 |
+| `scripts/check-docs.mjs` | 断言文档数字 == 实际（用例数、模块指纹/字节、模型 id、`maxTokens`/`contextWindow`、引擎版本）。只断言，不代写叙述 |
+| `scripts/ledger.mjs` | 汇总 `~/.dsh/local-delegate-ledger.jsonl`（每次 `delegate_batch` 写一行）：批次数、PASS 率、本地 token、按天/按 kind/按 cwd。`DSH_LOCAL_LEDGER=0` 关账本 |
 | `scripts/sync-install.mjs` | 同步进 profile 的 pnpm 副本（`--check` 只报） |
 | `scripts/subagent-trace.mjs` | 读任意会话/子代理的 zstd 记录，打印时间线（`--last`/`--watch`/`--raw`/`--json`） |
 | `tools/session-route-policy.mjs` | **换模型后必跑**：列出每个主会话的 durable 路由策略（`allows-local` / `dead-route` / `no-local-route`）。被钉在已删除模型上的会话，`subagent` 会被拒（`delegate_batch` 不受影响） |
@@ -359,12 +370,15 @@ unknown prompt variable "{{cwd}}" in section "deployment:persona-suffix"; regist
 | 文件 | 作用 |
 |---|---|
 | `cordis.patch.yml` | **生成物**：`standard` 预设逐字 + 一行。由 `tools/build-local-delegate-preset.py` 生成，别手改 |
+| `engine-profile.json` | **引擎事实的唯一来源**：模型 id、窗口、`maxTokens`、推理档位、采样、能力标志。生成器读它，`doctor`/`check-docs` 用它断言其余四处 |
 | `local-delegate.mjs` | 唯一增量：16 个校验器、`delegate_batch`（文本 / `files` / 图像 / 账本）、GUIDE 与 CHILD_GUIDE |
-| `local-delegate.selftest.mjs` | 229 个确定性用例（每条都钉一个行为或一个曾经的缺陷） |
-| `scripts/` | `sync-install.mjs`、`subagent-trace.mjs` 等（**不在安装副本白名单里**，从源码目录用） |
+| `local-delegate.selftest.mjs` | 233 个确定性用例（每条都钉一个行为或一个曾经的缺陷） |
+| `scripts/` | 运行时运维：`doctor`/`check-docs`/`ledger`/`sync-install`/`subagent-trace`（**不在安装副本白名单里**，从源码目录用） |
+| `tools/` | 生成、校验、取证：`build-local-delegate-preset`/`dump-shipped-preset`/`validate-preset-bundle`/`check-profile-roster`/`asar-read`/`session-*`（2026-10-18 从隔壁仓库收进来并入库） |
 | `README.md` | **中文主说明**（本文件） |
 | `README.en.md` | 英文完整版（含全部测量出处） |
-| `NEXT-SESSION.md` | 中文交接单（开发过程、未决项、指纹） |
+| `NEXT-SESSION.md` | 开工交接单：当前状态 + 待办 + 坑速查（≤150 行） |
+| `HISTORY.md` | 逐轮开发记录（原 `NEXT-SESSION.md`，按时间倒序），数字是当时的值 |
 
 ---
 
