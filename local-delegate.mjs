@@ -78,15 +78,15 @@ const NON_COMPLETED_STOPS = new Set(['max-tokens', 'aborted', 'error', 'refusal'
 
 /** The local route. `strata` is the provider row the deployment registers for its engine. */
 const LOCAL_PROVIDER = process.env.DSH_LOCAL_PROVIDER || 'strata'
-const LOCAL_MODEL = process.env.DSH_LOCAL_MODEL || 'qwen3.8-flash-next-iq2_xs'
+const LOCAL_MODEL = process.env.DSH_LOCAL_MODEL || 'qwen3.8-flash-next-iq3_xxs'
 
 /**
  * Per-call reasoning effort, or '' for "leave it to the provider".
  *
  * Default is '' on purpose: the `strata` provider advertises no reasoning efforts, and asking
- * for one is rejected before the request is sent —
- *   provider "strata" model "qwen3.8-flash-next-iq2_xs" does not support reasoning effort "none"
- * (measured 2026-10-01 against the live harness). To delegate with thinking OFF, either declare
+ * for one is rejected before the request is sent — the harness prints
+ *   provider "strata" model "<LOCAL_MODEL>" does not support reasoning effort "none"
+ * (measured 2026-10-01 against the live harness, with the then-installed model id). To delegate with thinking OFF, either declare
  * the effort in the provider config or set the engine's shared default; README.en.md has both.
  */
 const REASONING_EFFORT = process.env.DSH_LOCAL_REASONING_EFFORT || ''
@@ -96,9 +96,9 @@ const REASONING_EFFORT = process.env.DSH_LOCAL_REASONING_EFFORT || ''
  *
  * This is a COST decision, not a capability claim. An earlier revision of this comment said the
  * local model "has no tool loop": that is true of the engine's own HTTP API and FALSE of a
- * delegated child, because the harness supplies the loop. Measured (2026-10-01, 0 API tokens): a
- * child on `strata/qwen3.8-flash-next-iq2_xs` called `read` and answered from the file, and
- * called `glob` then `read_image` and read a picture correctly — two tool steps.
+ * delegated child, because the harness supplies the loop. Measured (2026-10-01, 0 API tokens, on the
+ * engine installed then, IQ2_XS): a child on the local route called `read` and answered from the
+ * file, and called `glob` then `read_image` and read a picture correctly — two tool steps.
  *
  * The reason to strip anyway: a 3-line, 12-token task produced a **13,023-token** prompt with the
  * inherited schemas (2,780 without) and a **5,606 ms** cold prefill, because the child inherits the
@@ -264,8 +264,8 @@ const GUIDE =
   + 'A gate with no discriminating power is reported instead of being used, so a decorative verifier costs nothing. Switch on a `semantics` flag only when the mutant really is wrong — a false alarm condemns a gate that is fine.\n'
   + '- READ THE WHOLE ANSWER. A task verdict that PASSes carries only a short `raw` echo; when the answer is longer, the plugin WRITES the full answer to disk and returns `outputFile` (with bytes and sha256). Read that file instead of re-running the task — a delegated child has no tools, so it cannot write the file itself.\n'
   + '- WHEN THE LOCAL MODEL NEEDS TOOLS, CALL `subagent` INSTEAD OF `delegate_batch`. `delegate_batch` strips every tool on purpose (measured: a 13,023-token prompt with the inherited schemas and a 5,606 ms cold prefill, versus 2,780 tokens stripped), because its shapes are text in / text out. '
-  + 'But a delegated child DOES inherit tools — the harness supplies the loop — measured on `strata/qwen3.8-flash-next-iq2_xs`: a child used `read` and answered from the file, and used `glob` then `read_image` to read a picture correctly, both for 0 API tokens. '
-  + 'So for "open these files" or "read this screenshot", call `subagent(provider="strata", model="qwen3.8-flash-next-iq2_xs")`: ~5.6 s for the first step, then ~1 s per step through the prefix cache. It carries NO verifier, so gate the answer with `verify_task` yourself before using it. '
+  + 'But a delegated child DOES inherit tools — the harness supplies the loop — measured 2026-10-01 (0 API tokens, on the engine installed then, IQ2_XS): a child on the local route used `read` and answered from the file, and used `glob` then `read_image` to read a picture correctly. '
+  + 'So for "open these files" or "read this screenshot", call `subagent(provider="' + LOCAL_PROVIDER + '", model="' + LOCAL_MODEL + '")`: on that engine ~5.6 s for the first step, then ~1 s per step through the prefix cache. It carries NO verifier, so gate the answer with `verify_task` yourself before using it. '
   + 'MEASURED SHAPE COST: the fixed prompt prefix is ~2.4K tokens for `delegate_batch` versus ~15.3K for a tool-using `subagent` (the tool schemas). A `subagent` answer must be handed BACK into `verify_task` to be gated, so it crosses your context twice — ask for compact answers, or have the child write the answer to a file and pass `contentFile` so it never has to be pasted back at all. A `delegate_batch` child cannot open anything: put the text in `prompt`, or name the paths in `files: [..]` and the plugin inlines their contents for you — NEVER paste a file into `prompt` yourself, because you pay for those bytes in your own context as well, which is the whole cost this exists to avoid. Every batch reports the local tokens it actually spent (prompt / read / reused / generated), read from the engine: that is the receipt for "0 API tokens".\n'
   + '- `subagent` DEFAULTS TO BACKGROUND (`run_in_background: true`): it then returns an id immediately, NOT the answer, and the result arrives later as a separate message. Do NOT poll `job_output` or `job_list` with that id — background jobs are a different mechanism and report `unknown job`. '
   + 'Pass `run_in_background: false` to block and get the result in the tool result instead. A delegated child never sees this guide, so if you delegate a task that itself calls `subagent`, put "pass run_in_background: false" in that task prompt. '
@@ -290,6 +290,7 @@ const GUIDE =
   + '- EVERY CHILD RUN HAS A WALL-CLOCK BUDGET (`DSH_DELEGATE_TIMEOUT_MS`, default 120 s). Past it the run is aborted and reported as `the child did not finish`, and it is NOT retried, because a budget overrun reproduces. This exists because a child can loop: measured, one re-delegated its own task 169 times and ran 341 s before a human aborted it. A task that legitimately needs longer than the budget is a task that is too big — split it, or raise that value.\n'
   + '- Ask for raw output. The local model is correct but polite: it wraps answers in ``` fences even when told not to. The verifiers strip fences, but writing '
   + '"Output ONLY raw JSON, no code fence, no prose" in the prompt still measurably reduces noise.\n'
+  + '- WORD THE TASK AS YOU MEAN IT: thinking takes a literal instruction literally. Measured 2026-10-15 - "extract every distinct verb that starts a sentence" returned `[]` at `low` (0/3), because every sentence starts with "The"; worded explicitly it passed 3/3 at every level. Read `reasoning_content` before blaming the model.\n'
   + '- VISION IS LOCAL TOO. The engine is multimodal: give a task an `images: ["<absolute path>"]` and the local model reads the picture (OCR, screenshots, '
   + '"what digit is in the shape", "describe sky/sun/ground"). Check a reading answer with `all_of` (expected = the strings that must all appear, case and '
   + 'punctuation ignored). Measured on this engine: 0.7-2.5 s per image, and image tokens scale with resolution (256x192 to 78, 640x480 to 330, 1280x960 to '
@@ -298,13 +299,9 @@ const GUIDE =
   + 'Name the shape the way it GEOMETRICALLY is: a square bounding box drawn as a circle is not an ellipse, and a correct reading that says "circle" must not '
   + 'be failed by a checker looking for "ellipse".\n'
   + '- A local result is usable only after its verifier PASSES. On FAIL or on any doubt, escalate to DeepSeek. Never ship an unverified local answer. `delegate_batch` does NOT resend on a FAIL by default (`retries: 0`): a blind resend never recovered in 10 same-shape observations, and since this engine is not reproducible a resend is a different sample, not a replay. If a task failed, the fix is to CHANGE something — split the input, or ask it differently — because a second identical failure means the task was not local-shaped.\n'
-  + '- DO NOT DELEGATE ORDERING BY SEMANTIC VERSION OR BY MIXED NUMERIC TEXT. Measured 5 runs each: sorting 3.10, 2.7, 3.9, 2.11 locally failed 5/5 with thinking off and 3/5 with it on, '
-  + 'always the same way — "3.10" is parsed as the number 3.1 and then sorted lexicographically to [2.11, 2.7, 3.1, 3.9]. That is a 1.89-bit quantisation limit, not a prompt bug. '
-  + 'Plain string and plain number ordering is fine. RE-MEASURED 2026-10-02 on this same engine id: 2/2 tasks of exactly this shape came back CORRECT on the first attempt, so treat this as a caution rather than a prohibition — the gate catches a wrong order and the attempt costs only local compute.\n'
-  + '- The engine is already greedy (temperature 0) by default, which is the measured 6/6 sampling configuration. Do not introduce a `sampling` block in the engine config: '
-  + 'sampled delegations failed a verifier one run in six. But GREEDY HERE DOES NOT MEAN REPRODUCIBLE: re-measured 2026-10-02, one identical prompt sent three times produced different answers every time (86/50/44, 321/46/57 and 49/48/54 generated tokens across three probe tasks), so a retry is a DIFFERENT answer, not a replay — never assume a re-send returns what the last one did.\n'
-  + '- Thinking is ON at `low` here, and that is deliberate: at `none` the model SILENTLY gets multi-step arithmetic wrong. Measured 2026-10-13 on this engine id: a three-step percentage question ("120 items, sell 1/3, then sell 1/4 of what is left, then add 60") came back `100` at `none` - 4 generated tokens, 0.4 s, no sign of doubt - where 120 is the right answer; `low` returned `120` (104 tokens, 1.0 s). `low`, `medium` and `high` were indistinguishable in latency and correctness, so the real choice is `none` versus `low`-and-above. '
-  + 'Simple work (extraction, JSON, runnable code, reading an image) passes in every mode, so this setting costs about +0.7 s and ~100 tokens per call and only pays off on multi-step reasoning. The engine shared setting is `reasoning_effort: low`; a request may override it with its own value. If delegations still feel slow, split the task - never weaken the checker.\n'
+  + '- SEMANTIC-VERSION ORDERING IS FINE HERE, BUT STILL GATE IT WITH `json_order`. On the engine this deployment ran before (IQ2_XS, 1.89 bit) it failed 5/5 - "3.10" was sorted as the number 3.1. Re-measured 2026-10-15 on the IQ3_S engine that replaced it: [2.7, 2.11, 3.9, 3.10], CORRECT, at every sampling setting. Plain string and plain number ordering is fine either way.\n'
+  + '- GREEDY (temperature 0) is the engine default and measured best: 6/6 at greedy, at 0.3 and at 0.6 + min_p 0.05 (2026-10-15). Do not add a `sampling` block - and CHECK `<config>.shared-settings.json`, which is the trap: the web Chat page writes it, it is merged into every request that brings no sampling of its own (a delegation is exactly that), so a temperature saved THERE silently samples every delegation while the config still looks greedy. Keep that file to `reasoning_effort` only. Greedy is NOT reproducible: one prompt sent three times gave three different answers (2026-10-02), so a retry is a new sample, not a replay.\n'
+  + '- THINKING RUNS AT `low`, deliberately. Measured 2026-10-15 on the IQ3_S engine over 14 tasks x 3 samples: at `none` multi-step reasoning scored 9/18 and logic 6/9 (the "120 items, sell 1/3, then 1/4 of what is left, add 60" question answered `100` in 4 tokens, 0.64 s, no sign of doubt); at `low` 18/18 and 9/9. `low` = `medium` = `high` in correctness, at 1.21 / 1.38 / 1.58 s median, so `low` is the whole gain at the lowest cost (+1 s, ~100 tokens per call). Mechanical work passes at every level, so the choice is `none` versus `low`-and-above. A request may override the shared setting. If delegations feel slow, split the task - never weaken the checker.\n'
   + '- LANGUAGE: the local model mixes Chinese and English in prose (~60% Chinese) and drifts further if the engine is resampled. That is fine for intermediate results — '
   + 'DeepSeek owns the final wording. Reply to the user in the SAME language as their message (default: 中文/Chinese), including any narration about what you delegated.'
 
@@ -425,7 +422,8 @@ function squash(s) {
 }
 
 /**
- * A 1.89-bit local model degenerates into a verbatim loop under long inputs. The caller must be
+ * A heavily quantized local model degenerates into a verbatim loop under long inputs (measured on
+ * the 1.89-bit engines this deployment ran earlier). The caller must be
  * told to split the input, not left hunting for a formatting bug: without this, a looping answer
  * is reported as `invalid JSON`, which reads like the model formatted badly.
  */

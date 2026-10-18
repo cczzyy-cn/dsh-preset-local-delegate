@@ -1,4 +1,259 @@
 # 新会话交接单 — `local-delegate` 预设的收尾验证
+
+## 最新一轮（2026-10-15）：本地模型 **IQ2_XS → IQ3_S**
+
+> **本节优先于下面所有记录。** 读这一节就能开工。
+
+### 0. 状态（逐项实测）
+
+| 层 | 值 | 怎么确认 |
+|---|---|---|
+| 模型 | **qwen3.8-flash-next-iq3_s**（3.5-bit 通用，文件在 `D:\Strata-data`） | `curl --noproxy "*" http://127.0.0.1:8080/health` → `{"model":"qwen3.8-flash-next-iq3_s","max_context":262144,"images":true,"loaded":true}` |
+| 配置 | `strata-iq3_s.json`，与旧 `strata-iq2_xs.json` **逐项一致**：`--max-context 262144 --kv int8 --kv-resident 32768 --spec 4 --spec-min-p 0.5 --vision --vram-reserve-mib 700`；唯一差别是**没有** `"host": "0.0.0.0"` | 直接读文件 |
+| 推理档位 | **`low`**，写在 `strata-iq3_s.shared-settings.json`，**且不含 temperature**（见坑 A） | `GET /settings` → `{"shared":true,"defaults":{"reasoning_effort":"low"}}` |
+| DSH 路由 | `strata/qwen3.8-flash-next-iq3_s`（`cordis.patch.yml` 两处：provider 模型行 + `allowedModels`） | `list_subagent_models provider=strata` |
+| preset | `LOCAL_MODEL` 默认改为 iq3_s；GUIDE 里基于 IQ2_XS 的实测数字按 IQ3_S 重测后改写；selftest **229 / 0** | `node local-delegate.selftest.mjs` |
+| ⚠ **未完成** | **`sync-install` + 重启 DSH 还没做**，所以此刻委派仍会被拒（见 §1） | `node scripts/sync-install.mjs --check` → 退出码 1 |
+
+### 1. 换模型的正确顺序（本轮把 README 顶部那条坑原样复现了一次）
+
+1. 引擎侧：`setup.py --yes --family qwen --model IQ3_S --context 262144 --data-dir D:\Strata-data --vision gpu --no-start --vram-reserve-mib 700`
+   → 下载 + 建 pack + 生成 `strata-iq3_s.json` / `run-iq3_s.bat`（本轮约 1 小时，见 §2）
+2. 起引擎：`start-strata.ps1 -Config ...\strata-iq3_s.json`（WMI 起，脱离本进程树）
+3. 引擎侧 shared settings：`POST /settings {"defaults":{"reasoning_effort":"low"}}`
+4. DSH 侧：改 `~/.dsh/profiles/desktop/cordis.patch.yml` 两处模型 id
+5. **`node scripts/sync-install.mjs` 把 `dsh-preset-local-delegate` 复制进 `<profile>/node_modules/`**
+6. **重启 DSH 本体**
+
+第 5、6 步缺一不可。本轮在第 4 步之后、第 5/6 步之前实测到的**症状**：
+
+```
+subagent { provider:"strata", model:"qwen3.8-flash-next-iq2_xs" }
+→ Error: child LLM route "strata/qwen3.8-flash-next-iq2_xs" is not allowed for this Session
+delegate_batch → 每个任务 stop=error、0 token、约 0.5 s
+```
+
+因为 profile 的允许列表已经读到 `iq3_s`，而**进程里那份 preset 模块的 `LOCAL_MODEL` 还是 `iq2_xs`**
+（模块每进程加载一次；GUIDE 文本每轮重算，工具绑定不重算）。
+`node tools/session-route-policy.mjs --model qwen3.8-flash-next-iq3_s` 本轮报告：
+**8 个旧主会话**钉在已删除的 `iq2_xs`（`dead-route`），`allows-local: 0`。
+
+### 2. 下载与建包（实测）
+
+| 项 | 值 |
+|---|---|
+| shard 1 | `…-IQ3_S-00001-of-00002.gguf` **51.05 GiB**（下载器显示 54.82 GB 十进制） |
+| shard 2 | setup 判定与 IQ2_XS **同一文件**（identical），直接复用，**没有重复下载** |
+| pack | `D:\Strata-data\packs\iq3_s`，1079 张量 / 302 走 native / arena **1.43 GiB** |
+| 专家 arena | **46.84 GiB**，加载 **5.86 GiB/s** |
+| D: 剩余 | 178.9 GB → **126.4 GB** |
+
+### 3. IQ3_S 实测（2026-10-15，本机 RTX 5070 Ti 16 GB + 69.6 GB RAM）
+
+`bench-toolmodel.py`（3 种采样 × 6 个工具任务）：
+
+| 配置 | 通过 | 中位延迟 | tok/s |
+|---|---|---|---|
+| greedy | **6/6** | 0.71 s | 55.5 |
+| t0.3 | **6/6** | 0.61 s | 88.2 |
+| t0.6 + min_p 0.05 | **6/6** | 0.61 s | 96.3 |
+
+**旧模型那条"版号排序必错"没了**：`3.10, 2.7, 3.9, 2.11` → `['2.7','2.11','3.9','3.10']`，三种配置全对
+（IQ2_XS 上实测 0/5，见下一节的记录）。这是换 3.5-bit 最直接的收益。
+
+思考档位（"120 件，卖 1/3，再卖剩下的 1/4，再加 60"）：
+
+| effort | 答案 | 生成 token | 耗时 |
+|---|---|---|---|
+| `none` | **100 ❌** | 4 | 0.64 s |
+| `low` | **120 ✅** | 97 | 1.69 s |
+| `medium` | 120 ✅ | 135 | 1.69 s |
+| `high` | 120 ✅ | 73 | 1.31 s |
+
+**`none` 的失败在 3.5-bit 上原样复现** → 这是思考通道的限制，不是量化的锅（GUIDE 已按此改写）。
+
+视觉（`bench-vision.py`，读数全部正确）：
+
+| 指标 | IQ2_XS | IQ3_S |
+|---|---|---|
+| 读图像 token 中位（引擎 prompt_ms） | 658 ms | **836 ms**（558–1178） |
+| 编码首次 / 缓存 | 97 / 42 ms | 150 / 43 ms |
+| 单图首帧 wall | 0.7–2.5 s | 1.1–2.5 s |
+
+### 3b. 思考档位实测（2026-10-15，IQ3_S，`bench-thinking-levels.py`）
+
+14 题 × 4 档 × 3 次采样 = 168 次调用，题分三类：机械 5 题（抽取/计数/可执行代码/版号排序/明示抽取）、
+多步推理 6 题（三段百分比、两段路程时间、折扣再税、时间差、工人天数、水池净流入）、逻辑 3 题（循环追踪、三段论有效性、谁最矮）。
+
+| 思考档 | 机械 5 题 | 多步推理 6 题 | 逻辑 3 题 | 合计 | 中位延迟 |
+|---|---|---|---|---|---|
+| `none` | 15/15 | **9/18** | **6/9** | 30/42 | 0.17 s |
+| **`low`（当前）** | 12/15 | **18/18** | **9/9** | 39/42 | 1.21 s |
+| `medium` | 14/15 | 18/18 | 9/9 | 41/42 | 1.38 s |
+| `high` | 15/15 | 18/18 | 9/9 | 42/42 | 1.58 s |
+
+1. **`none` 的损失是能力级的**：6 道推理题里 3 道 **0/3**（三段百分比答 `110`、两段路程时间答 `4.5`、
+   折扣再税答 `42.3`），逻辑组循环追踪也 0/3（答 `10`）。`low` 起推理 18/18、逻辑 9/9。
+2. **`low` 已经吃满收益**：low = medium = high 在推理/逻辑两组都满分，延迟 1.21 / 1.38 / 1.58 s。
+   **当前部署的 `low` 就是最优档**，往上只是多花时间。
+3. **机械组与档位无关**，唯一失分在"抽动词(原措辞)"（low 0/3、medium 2/3、high 3/3，none 3/3）。
+   这不是退化：原措辞是"extract every distinct verb that starts a sentence"，而每句开头是 "The"，
+   `low` 的思考原文写着 *"starts with 'The', not a verb"*，按字面就该给 `[]`。**同一题改成明示措辞
+   （"each sentence looks like 'The <thing> <verb> ...'"）后每个档位都 3/3，包括 low** —— 这一对是证据，
+   不是猜的。**歧义措辞 + 思考 = 字面理解。**
+4. 自证坑：本脚本第一版的数字检查器按**字面字符串**匹配，把 `high` 的正确作答 `37.80` 判成 FAIL
+   （期望 `37.8`）。改成按数值比较，并用 9 个判别用例自证（`37.80==37.8`、`1200≠120`、`4.5≠6`…）。
+   任何"模型失败"先怀疑检查器。
+
+### 4. 这次换模型的真正代价是内存，不是速度
+
+引擎加载时的原话：
+
+```
+memory guard: limit 69.6 GiB, current 26.6 GiB, available 43.1 GiB
+WARNING: the expert arena needs 46.84 GiB of RAM but 39.04 GiB is available (7.80 GiB short)
+loaded 46.84 GiB at 5.86 GiB/s
+Windows commit: 3.1 GiB left of a 98.7 GiB limit … it can end at the limit with no message (exit code 0xC0000409)
+only 482 MiB of VRAM free … Add --vram-reserve-mib 1280
+```
+
+即：**arena 差 7.8 GiB**、加载后整机只剩约 6 GB 可用 RAM / 3.1 GiB commit、显存剩 370–536 MiB。
+速度实测没问题（§3），但引擎自己把 commit 上限标成了崩溃风险。若要更稳：抬高页面文件、
+或 `--max-context 131072`（KV 3.09 GiB → 约 1.5 GiB）、或 `--vram-reserve-mib 1280`（换更小的专家缓存）。
+**本轮没有改这三项**——先按用户选定的 262144 跑，风险如实记在这里。
+
+### 4b. 长提示词 / 长会话压测（2026-10-15，同一进程 PID 35404，全程未崩）
+
+上面那条 commit 警告是**加载时的一次性预测**（"计划 2.0 GiB 主机分配"），实测**没有兑现成增长**：
+
+| 测试 | 结果 | commit | 工作集 |
+|---|---|---|---|
+| `tools/needle_bench.py` 32k @50% | FOUND，32,789 tok，12 s | 90.7 → 90.7 | +0.18 GB |
+| 128k @10/50/90% | **3/3 FOUND**，124,879 tok，38–43 s | 90.8 → 91.1 | −4.2 GB |
+| 200k @50% | FOUND，198,079 tok，44 s | 91.2 → 91.0 | 持平 |
+| **满窗口** 267000 @10/50/90% | **3/3 FOUND**，257,742 tok，87–91 s | 91.0 → 91.2 | −2.7 GB |
+| `tools/conversation_growth_needle.py` 8 轮 ×40K 字符 | 8/8，最慢 5.5 s，末轮 read 34 / reused 86,170，**暗号 FOUND** | 91.2 → 91.4 | +1.25 GB |
+| 同上 12 轮 ×60K 字符（终态 **205,237 tok**） | 12/12，最慢 9.1 s，末轮 read 35 / reused 205,202，**暗号 FOUND** | 91.5 → 91.4 | +0.4 GB |
+
+结论：**两种压力各跑到接近上限都没有触发 0xC0000409，也没有 OOM**；单轮 257,742-token 提示词的
+prefill 约 2,900 tok/s，会话每轮只付新增的约 12–20K token（前缀复用 86K→205K）。
+`/metrics` 同时澄清了一件事：本部署的 **conversation cache 是关的**（`conversation_cache_mib: 0`、
+`enabled: false`、`parked: 0`）——所以上面那个 `reused` 是**引擎对同一序列的前缀复用**，不是"停放的会话缓存"。
+吃内存的是 `arena_mib: 47962`（46.84 GiB pinned 专家）与 `expert_cache_mib: 5988`（显存）。
+
+顺带纠正一条旧断言：README 状态表里"可靠上下文 ≤ 142K（145K 不稳定、231K 必失败）"是 **IQ2_XS 时代**的实测；
+在 IQ3_S 上 **257,742 token 三个深度全对**（3/3，只测了一轮长度，不足以直接改写那条，但值得重扫一遍）。
+
+### 5. 坑 A：`shared-settings.json` 会偷偷给每次委派加上采样
+
+`strata-iq2_xs.shared-settings.json` 里当时是 `temperature 0.6`，而 `serve/server.py` 的 `_run` 是
+`defaults = {**self.sampling_defaults, **self.shared}`——**委派请求不带 temperature，所以每一次委派都在按 0.6 采样**，
+而配置里看着还是"贪心"。这文件是网页 Chat 页写的。
+IQ3_S 这份只写 `{"reasoning_effort": "low"}`，**不要再往里塞 temperature**。
+
+### 6. 同日：引擎 0.1.43.1 → **0.1.44.1**（上游 282 个提交）
+
+`git fetch`（走代理 4 秒）显示本地落后 origin/main **282 个提交**，上游已发 **v0.1.44 / v0.1.44.1**，
+`MIN_ENGINE` 也升到 `(0,1,44,1)`。做法：`git stash push -- .gitignore serve/web/app.js` → `git pull --ff-only`
+（纯快进，无冲突；上游对 `app.js` 的 hunk 在第 73/103/1081 行，我们的改动在第 557 行）→ `git stash pop`
+→ 停引擎 → `setup.py --update` → 重启。
+
+| 项 | 0.1.43.1 | **0.1.44.1** |
+|---|---|---|
+| 引擎 `strata.exe` | 160.5 MB / `AA690AE65BFD306D` | **181.2 MB / `BD18453F65B4D03B`** |
+| memory guard 加载时 | current 26.6 / available 43.1 GiB | **12.9 / 56.8 GiB** |
+| arena 差 7.8 GiB 警告 | 出现 | **没有出现** |
+| Windows commit（**加载时**） | 3.1 GiB left / 98.7 | 6.6 GiB left / 94.6 |
+| 工具任务 greedy | 6/6 · 0.71 s · 55.5 tok/s | 6/6 · 0.68 s · **63.0 tok/s** |
+| 128K 针 | FOUND · 43 s | FOUND · 43 s |
+| 专家缓存槽 / 显存 | 3053 / 5988 MiB | **3155 / 6188 MiB** |
+| 推理组 none → low | 9/18 → 18/18 | 9/18 → **18/18** |
+
+**⚠ 上表的"内存更宽裕"是加载时快照，别当成收益 —— 同一天的稳态复测（2026-10-15 晚）：**
+
+| 稳态指标 | 0.1.43.1 | 0.1.44.1 |
+|---|---|---|
+| 系统 commit 已用 | 90.7–91.6 GB | **90.8 GB（一样）** |
+| `arena_mib`（引擎真正的主机分配） | 47962 | **47962（逐字节相同）** |
+| strata 工作集 | 28.7–35.6 GB | **46.0 GB**（私有提交 66.2 GB） |
+| 页面文件 / commit 上限 | 30 GB / 99.7 GB | **25 GB / 94.6 GB** |
+| commit 余量 | 引擎报 3.1 GiB | **3.8 GiB** |
+
+所以：**换引擎没有减少内存占用，紧度也没解除**。两处"看起来变多/变好"都有解释：
+① 工作集 29–36 GB → 46 GB 是**驻留口径**（46.8 GiB arena 用 `cudaHostRegister PORTABLE` 注册，系统可以把它裁到待机列表，被裁时工作集就小），**分配没变**；
+② 加载时那次"6.6 GiB 余量"是**当时机器更干净**（刚下完的 51 GB 文件缓存已被丢弃，Cache 仅 0.3 GB，available 56.8 GiB），而旧引擎是下载后立刻加载（available 43.1 GiB），所以那条 arena 警告没出现**不是引擎变省了**；
+③ 页面文件被 Windows 从 30 GB 缩到 25 GB，commit 上限降 5 GB。
+
+`setup.py --update` **没有改动任何配置**（`strata-iq3_s.json` 与更新前备份逐行一致）。
+
+**两个坑（都实测）：**
+
+1. **`--update` 不走代理**：它从 GitHub Releases 直连拉 `strata-windows-x64.zip`，实测 **96 KB/s**（10 分钟 5%）；
+   设 `HTTP_PROXY`/`HTTPS_PROXY=http://127.0.0.1:10808` 后 **2.94 MB/s（≈30×）**，整包 20 秒。
+   `git` 的 `http.proxy` 配置它**不读**。
+2. **中途 kill 会删掉 `engine/BUILD.json`，之后更新静默变空操作**：`update_installed_engine` 第一行是
+   `if not info.exists(): return`，所以第二次跑打印 "[ok] Strata is updated (engine 0.1.43.1)" 却什么都没做
+   （末行版本是从 exe 读的，不报错）。恢复备份的 `BUILD.json` 再跑即修复；判断换没换**只看 exe 的大小与 SHA-256**。
+
+### 7. 同日的上下文实验：262144 → 131072 → **调回 262144**
+
+> **最终状态：`--max-context 262144`（模型训练长度），profile `contextWindow 262144` / `maxTokens 65536`。**
+> 中间那次 131072 是省内存实验，同日按用户要求撤回。两组数字都留在这里，**别把 131072 当成当前状态**。
+
+配置 `strata-iq3_s.json` 的 `--max-context` 曾改成 `131072`，profile 同步 `131072`/`32768`（**两处必须与
+`/health` 的 `max_context` 对齐**，否则 harness 按一个引擎没有的窗口开会话）；同日两边都改回 `262144`/`65536`。
+
+| 指标 | 262144（当前） | 131072（实验） | 变化 |
+|---|---|---|---|
+| KV 常驻 RAM | 3.09 GiB | **1.55 GiB** | −1.54 GiB |
+| 物理可用 RAM | **0.8 GB** | 4.5 GB | 131072 明显宽裕 |
+| commit 已用 / 上限 | 90.8 / 94.6（余 3.8 GiB） | 88.3 / 94.6（余 8.1 GiB） | 131072 多 4.3 GiB |
+| 显存空闲（加载后） | **73 MiB，引擎标 LOW**（它建议 `--vram-reserve-mib 1139`） | 有裕量 | 262144 明显更紧 |
+| 专家缓存槽（显存） | 3164 | 3254 | — |
+| `arena_mib`（专家） | 47962 | 47962 | 不变，仍是最大头 |
+
+功能验收：131072 时 `/health` → `131072`，128K 针（125,011 token）深度 10/90 **2/2 FOUND，45 s**；
+`bench-toolmodel.py` 第一次出现 greedy **5/6**，**复跑三次全部 18/18**（这台引擎贪心也不可复现，见 GUIDE）——单次 5/6 是抖动，不是上下文变更的回归。
+调回 262144 后：`/health` → `262144`，**200K 针 FOUND（200,095 token，76 s）**；代价是物理可用 RAM 掉到 0.8 GB、
+显存只剩 73 MiB（引擎警告 requests may stall）。
+
+**还没做的**：profile 的改动要**重启 DSH 本体**才生效（`contextWindow` 是启动时读的）。当前引擎窗口是 262144，
+DSH 未重启时按 131072 开会话——**这个方向是安全的**（提前压缩，不会 400），重启后即对齐。
+想省内存：`--kv q4_0`（KV −1.4 GiB）、`--prompt-cache 2`（−0.47 GiB）、去掉 `--vision`（−2.0 GiB）、
+`--resident-experts`（−40 GiB 量级但显著变慢）、`--vram-reserve-mib 1139`（把显存还回去，专家缓存变小）。
+`--ple-io` 保持默认 `direct`（表不进 RAM）；`--kv-resident` 别再降（方向相反，会把 KV 挪回 RAM）。
+
+### 8. 2026-10-16：模型换成 **IQ3_XXS**（内存换档，能力实测不降）
+
+> **当前状态：模型 `qwen3.8-flash-next-iq3_xxs`、`--max-context 262144`、`--kv int8`、engine 0.1.44.1。**
+> IQ3_S 的文件先留着（回退用）；注意两者的 **shard 2 是同一硬链接**，删任一份都不会释放那 26.82 GiB。
+
+为什么换：IQ3_S 在 262144 下把整机逼到物理可用 **0.7 GB**、commit 余 5.4 GB、显存只剩 73 MiB；
+IQ3_XXS 的专家 arena 小 6.9 GiB，正好补上这个缺口。下载走 **ModelScope**（HF 直连已不通、代理也只有 0.15 MB/s；
+`--source modelscope` 实测 11–36 MB/s，47.04 GB 约 40 分钟；shard 2 直接复用同一硬链接）。
+
+| 指标 | IQ3_S | **IQ3_XXS** |
+|---|---|---|
+| 专家 arena（`arena_mib`） | 47962 MiB / 46.84 GiB | **40925 MiB / 39.97 GiB** |
+| 物理可用 RAM | 0.7 GB | **10.9 GB** |
+| commit 已用 / 余量 | 89.3 / 5.4 GB | **80.5 / 14.2 GB** |
+| commit 余量（加载时引擎口径） | 8.1 GiB | **15.9 GiB** |
+| 专家缓存槽（显存） | 3164 | **4158** |
+| 显存空闲 | 73 MiB（建议 `--vram-reserve-mib 1139`） | **174 MiB**（建议 1038） |
+| 工具任务 greedy / t0.3 / t0.6 | 6/6 · 6/6 · 6/6 | **6/6 · 6/6 · 6/6** |
+| 中位延迟 / tok/s（greedy） | 0.68 s · 63.0 | **0.59 s · 70.7** |
+| t0.6 + min_p（最快档） | 0.61 s · 93.3 | **0.53 s · 101.9** |
+| 200K 针 | FOUND · 76 s | **FOUND · 200,095 tok · 76 s** |
+| 推理组 `none` → `low` | 9/18 → 18/18 | **9/18 → 18/18** |
+
+判读：**能力与速度都测不出差别（甚至略快），换来的是 6.9 GiB 主机内存**——这是"降内存"里唯一幅度够大又不掉速的一招。
+DSH 侧同步改了：profile 的 `models[0].id` 与 `allowedModels` → `qwen3.8-flash-next-iq3_xxs`（`agent-default-model` 由用户保持在
+deepseek-official），preset 的 `LOCAL_MODEL` 默认值 → iq3_xxs，`sync-install` 已同步、selftest 229/0、指纹 `BAC60126866B4D9C`（123,872 B）。
+
+**必须做的**：**重启 DSH 本体**。否则进程里那份 preset 还是 `iq3_s`，而引擎已经在服务 `iq3_xxs` →
+委派会报 `child LLM route "strata/qwen3.8-flash-next-iq3_s" is not allowed for this Session`（这条坑见 §1）。
+
+---
 ## 最新一轮（2026-10-13 二轮）：状态全绿，`subagent` 已恢复，并修好两个**误导性诊断**
 
 > **本节优先于下面所有记录（含上一轮那份 2026-10-13「引擎/模型换代」）。** 读这一节就能开工。

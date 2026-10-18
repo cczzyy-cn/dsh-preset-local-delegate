@@ -22,6 +22,9 @@
 > 而不是内容来键控——所以改完 `local-delegate.mjs` 再"重新安装"，它会打印 *"Already up to date"*，
 > 而 harness 跑的还是**旧模块**。2026-10-13 实测：这导致每次委派都被拒绝，报
 > `route "strata/qwen3.8-flash-next-iq2_xs" is not allowed`，因为线上那份的 `LOCAL_MODEL` 还留着已删除的模型 id。
+> **2026-10-15 换模型时又原样复现了一次**（IQ2_XS → IQ3_S）：新配置已经生效、引擎 `/v1/models` 只报 `iq3_s`，
+> 而进程里那份 `LOCAL_MODEL` 还是 `iq2_xs` → 每次委派都被拒（`delegate_batch` 报 `stop=error`，0 token）。
+> 所以"换了模型"必须走完 **sync-install + 重启 DSH** 两步，缺一不可。
 >
 > **每次改完都跑这两条，然后重启 DSH 本体：**
 >
@@ -39,7 +42,7 @@
 
 ## 一、它解决什么问题
 
-本地引擎（本机 Strata，`qwen3.8-flash-next-iq2_xs`）免费但**不可靠**：同一个 prompt 发三次可能两次对、一次烧满 120 秒预算。
+本地引擎（本机 Strata，`qwen3.8-flash-next-iq3_s`）免费但**不可靠**：同一个 prompt 发三次可能两次对、一次烧满 120 秒预算。
 API token 贵但可靠。于是关键判断不是"这个任务看起来简单吗"，而是：
 
 > **我能不能为这个答案写出一个确定性校验器？**
@@ -56,14 +59,15 @@ API token 贵但可靠。于是关键判断不是"这个任务看起来简单吗
 
 | 项 | 值 | 怎么确认 |
 |---|---|---|
-| 引擎 | Strata **0.1.43.1** | `engine/BUILD.json` 或引擎日志 `session is up (engine …)` |
-| 模型 | **qwen3.8-flash-next-iq2_xs**（2-bit 通用） | `curl http://127.0.0.1:8080/health` |
-| 引擎窗口 / 图像 | `max_context` **262144**、`images: true` | 同上 |
-| 推理档位 | **`low`**（引擎 shared 默认）——**不要调回 `none`** | `GET /settings`；而正确性证据见 §九 |
-| DSH 路由 | `strata/qwen3.8-flash-next-iq2_xs`，`contextWindow 262144` / `maxTokens 8192` | `list_subagent_models provider=strata` + profile patch |
-| 可靠上下文 | **≤ 142K token**（145K 不稳定、231K 必失败） | 实测（见 §八） |
-| 自检 | **226 passed, 0 failed** | `node local-delegate.selftest.mjs` |
-| 模块指纹 | `local-delegate.mjs` `D98C684112B9306F`（123,771 B） | `Get-FileHash` / `sha256sum` |
+| 引擎 | Strata **0.1.44.1**（2026-10-15 从 0.1.43.1 升级；`strata.exe` 181.2 MB / `BD18453F65B4D03B`） | `engine/BUILD.json` 或引擎日志 `session is up (engine …)` |
+| 模型 | **qwen3.8-flash-next-iq3_xxs**（约 3-bit 通用；2026-10-16 从 IQ3_S 换过来，内存少 6.9 GiB） | `curl http://127.0.0.1:8080/health` |
+| 引擎窗口 / 图像 | `max_context` **262144**（模型训练长度；2026-10-15 曾降到 131072 省内存，同日按用户要求调回）、`images: true` | `curl http://127.0.0.1:8080/health` |
+| 推理档位 | **`low`**（引擎 shared 默认）——**不要调回 `none`**（IQ3_XXS 上推理组 `none` 9/18、`low` 18/18） | `GET /settings`；而正确性证据见 §九 |
+| DSH 路由 | `strata/qwen3.8-flash-next-iq3_xxs`，`contextWindow 262144` / `maxTokens 65536`（**两处必须与引擎的 `max_context` 对齐**；提示词硬上限 = 窗口 − maxTokens = 196608） | `list_subagent_models provider=strata` + profile patch |
+| 内存余量 | 262144 下：IQ3_XXS 的 `arena_mib` = **40925 MiB（39.97 GiB）**、KV pinned 3.09 GiB、物理可用 **10.9 GB**、commit 余 14.2 GB；IQ3_S 同样上下文是 arena 47962 MiB、物理可用 **0.7 GB**、commit 余 5.4–8.1 GiB（换小量化是**唯一幅度够大的降内存手段**，省下的是 6.9 GiB）。**显存**：两者加载后都偏紧（IQ3_XXS 174 MiB、IQ3_S 73 MiB），引擎建议 `--vram-reserve-mib 1038`/`1139` | `Win32_PerfFormattedData_PerfOS_Memory` 的 CommittedBytes、引擎日志 `memory guard` / `VRAM free` |
+| 自检 | **229 passed, 0 failed** | `node local-delegate.selftest.mjs` |
+| 可靠上下文 | IQ2_XS 时代实测 **≤ 142K**（145K 不稳定、231K 必失败，见 §八）；**IQ3_S 上 257,742 token 三个深度 3/3 全对**（2026-10-15，只测了一个长度，待重扫） | 实测 |
+| 模块指纹 | `local-delegate.mjs` `BAC60126866B4D9C`（123,872 B，2026-10-16 换 IQ3_XXS 后） | `Get-FileHash` / `sha256sum` |
 
 ---
 
@@ -72,7 +76,7 @@ API token 贵但可靠。于是关键判断不是"这个任务看起来简单吗
 ```bash
 node scripts/sync-install.mjs          # 或 npm run sync
 node scripts/sync-install.mjs --check  # 只检查，不改
-node local-delegate.selftest.mjs       # 226 个确定性用例
+node local-delegate.selftest.mjs       # 229 个确定性用例
 ```
 
 `sync-install` 把这些文件复制进 `$DSH_HOME/profiles/desktop/node_modules/dsh-preset-local-delegate/`：
@@ -272,7 +276,7 @@ node local-delegate.selftest.mjs       # 226 个确定性用例
 | 单次墙钟预算 | `DSH_DELEGATE_TIMEOUT_MS`，默认 **120 s**（可用任务级 `timeoutMs` 覆盖）；超时即 `aborted`、**不重试** |
 | 重试 | 默认 **0**——10 次同形状观察里盲重发从未救回（且引擎**非确定性**，重发是**另一个样本**，不是重放） |
 | 输入规模 | `delegate_batch` 建议 **< 40 行 / 4K 字符**内联；更大的任务**用 `files:` 或切开**（实测 47 行抽取会退化成逐字复读） |
-| 输出上限 | `maxTokens 8192`（profile）/ `DSH_LOCAL_MAX_TOKENS` 4096（单次生成）——形状是**输入可以很大、输出要小** |
+| 输出上限 | `maxTokens 131072`（profile）/ `DSH_LOCAL_MAX_TOKENS` 4096（单次生成）——形状是**输入可以很大、输出要小** |
 | 容量**不可查询** | `list_subagent_models` **只给名字**。真实窗口看引擎 `GET /health` 的 `max_context`；**引擎从不截断**，`prompt + maxTokens` 超窗口直接 400 `CONTEXT_WINDOW_EXCEEDED` |
 | 可靠上下文 | **≤ 142K token**；越界后不是"找不到"，而是**指令跟随整体崩塌**（还会撞满 max_tokens）。**委派 prompt 控制在 128K 以内** |
 | 图像 | `images: ["<绝对路径>"]`；640×480 ≈ 330 token、1280×960 ≈ 1002。**引擎只读不画**，没给它的它看不见 |
@@ -307,7 +311,7 @@ node local-delegate.selftest.mjs       # 226 个确定性用例
 ```powershell
 cd <此仓库>
 node --check local-delegate.mjs
-node local-delegate.selftest.mjs                     # 期望 226 passed, 0 failed
+node local-delegate.selftest.mjs                     # 期望 229 passed, 0 failed
 node scripts/sync-install.mjs --check                # 期望 up to date
 cd ..
 python tools\build-local-delegate-preset.py --check  # cordis.patch.yml 是否与源码一致
@@ -335,7 +339,7 @@ node   tools\session-headers.mjs --preset hybrid-router --blank   # 期望 0
 |---|---|
 | `cordis.patch.yml` | **生成物**：`standard` 预设逐字 + 一行。由 `tools/build-local-delegate-preset.py` 生成，别手改 |
 | `local-delegate.mjs` | 唯一增量：16 个校验器、`delegate_batch`（文本 / `files` / 图像 / 账本）、GUIDE 与 CHILD_GUIDE |
-| `local-delegate.selftest.mjs` | 226 个确定性用例（每条都钉一个行为或一个曾经的缺陷） |
+| `local-delegate.selftest.mjs` | 229 个确定性用例（每条都钉一个行为或一个曾经的缺陷） |
 | `scripts/` | `sync-install.mjs`、`subagent-trace.mjs` 等（**不在安装副本白名单里**，从源码目录用） |
 | `README.md` | **中文主说明**（本文件） |
 | `README.en.md` | 英文完整版（含全部测量出处） |

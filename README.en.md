@@ -40,7 +40,11 @@ to text: a vision answer with no checker is not delegable either.
 > re-install prints *"Already up to date"* while the harness keeps running the **old module**.
 > Measured 2026-10-13: that cost a long debugging session in which every delegation was refused
 > with `route "strata/qwen3.8-flash-next-iq2_xs" is not allowed`, because the live copy still held
-> the deleted model id as `LOCAL_MODEL`.
+> the deleted model id as `LOCAL_MODEL`. **Reproduced verbatim 2026-10-15**, during the IQ2_XS → IQ3_S
+> swap: the new config was live and the engine answered `/v1/models` with `iq3_s` only, while the
+> loaded module still asked for `iq2_xs` — every delegation was refused (`delegate_batch` reported
+> `stop=error`, 0 tokens, in ~0.5 s). Swapping a model therefore needs **sync-install AND a DSH
+> restart**; neither alone is enough.
 >
 > **Two commands after every edit:**
 >
@@ -299,7 +303,7 @@ http(s) URL, or a bare local path), and the engine advertises it:
 
 ```
 GET /v1/models → architecture.input_modalities = ["text", "image"]
-GET /health    → {"status":"ok","model":"qwen3.8-flash-next-iq2_xs","images":true,"loaded":true}
+GET /health    → {"status":"ok","model":"qwen3.8-flash-next-iq3_s","images":true,"loaded":true}
 ```
 
 So the capability was always there — the delegation layer just had no way to carry a picture.
@@ -446,7 +450,7 @@ generated tokens means **the thinking channel is on by default**.
 `delegate_batch` therefore sends:
 
 ```js
-{ agentOptions: { provider: 'strata', model: 'qwen3.8-flash-next-iq2_xs', maxTokens: 4096 },
+{ agentOptions: { provider: 'strata', model: 'qwen3.8-flash-next-iq3_s', maxTokens: 4096 },
   toolFilter: { allow: [] },          // the local model has no tool loop: schemas are pure overhead
   persona: '<a two-line tool-model persona>' }
 ```
@@ -465,23 +469,33 @@ generated tokens means **the thinking channel is on by default**.
 | claim | source |
 |---|---|
 | an absent `temperature` keeps the engine's default, **which is greedy (0)** | `serve/server.py:161-162` |
-| greedy measured 6/6 on the tool-task set; `temperature 0.6` measured 5/6 | `本地工具模型建议.md` §3.1 |
+| greedy measured 6/6 on the tool-task set; `temperature 0.6` measured 5/6 | `本地工具模型建议.md` §3.1 (IQ2_XS era) |
+| **re-measured 2026-10-15** on the IQ3_S engine that replaced IQ2_XS: greedy 6/6, temperature 0.3 6/6, temperature 0.6 + min_p 0.05 6/6, medians 0.61–0.71 s at 55–96 tok/s | `bench-toolmodel.py` |
 | the engine accepts exactly `reasoning_effort: none \| low \| medium \| high` | `serve/server.py:1764-1766` |
 | thinking off measured 5/5 on extraction/counting/arithmetic/code at a 0.61 s median; on, a 3.48 s median and a 12.42 s worst case, with no correctness gain on those classes. **Caveat added 2026-10-13:** those classes were not multi-step arithmetic, where `none` is silently wrong (see *Thinking now runs at `low`* below) | `本地工具模型建议.md` §3.2 |
 
-So **do not add a `sampling` block to the engine config** — the delegation path is already on the
-6/6 configuration. Temperature was never the problem.
+So **do not add a `sampling` block to the engine config** — but check the file that is easy to
+forget, because it defeats that rule: `<config>.shared-settings.json` is merged into every request
+that carries no sampling of its own (`serve/server.py`, `_run`:
+`defaults = {**self.sampling_defaults, **self.shared}`), and a delegation request is exactly that —
+the preset sends no temperature. The web Chat page writes that file, so **a temperature saved there
+silently samples every delegation while the config still looks greedy**. Measured 2026-10-15: the
+IQ2_XS deployment's file held `temperature 0.6`, i.e. the 5/6 configuration, and nothing in the
+config said so. The IQ3_S file is `{"reasoning_effort": "low"}` and nothing else, so the delegation
+path is on the greedy configuration again.
 
 **Thinking now runs at `low` at the engine for this deployment** (`POST /settings {"defaults":
-{"reasoning_effort":"low"}}`, persisted to `strata-iq2_xs.shared-settings.json`), because the
+{"reasoning_effort":"low"}}`, persisted to `strata-iq3_s.shared-settings.json`), because the
 engine's shared defaults fill in only where a request carries none of its own (`serve/server.py:759`)
-and the harness sends none. This replaced an earlier `none`. Measured on this machine, 2026-10-13,
-on the model this deployment now runs (`qwen3.8-flash-next-iq2_xs`):
+and the harness sends none. This replaced an earlier `none`. Measured on this machine, 2026-10-13, on
+the model this deployment ran then (`qwen3.8-flash-next-iq2_xs`) and **re-measured unchanged
+2026-10-15 on `qwen3.8-flash-next-iq3_s`** — so the failure below is a thinking-mode limit, not a
+2-bit artifact:
 
 | measurement | at `none` | at `low` |
 |---|---|---|
 | a 3-step percentage question ("120 items, sell 1/3, then sell 1/4 of what is left, add 60") | **100 — wrong** | **120 — right** |
-| generated tokens / wall time on that task | 4 tok / 0.4 s | 104 tok / 1.0 s |
+| generated tokens / wall time on that task | 4 tok / 0.4 s (IQ2_XS), 4 tok / 0.64 s (IQ3_S) | 104 tok / 1.0 s (IQ2_XS), 97 tok / 1.69 s (IQ3_S) |
 | `low` vs `medium` vs `high`, latency and correctness | — | indistinguishable from each other |
 
 The reason is correctness, not speed: at `none` the model answers multi-step arithmetic **silently
@@ -508,22 +522,25 @@ and roughly a second of wall time, not 3–5×. It is free, so it is on; a calle
 back must still declare the effort on the provider row (option 2 below), because `strata` rejects an
 effort it does not advertise.
 
-### Do not delegate version or mixed-numeric ordering
+### Version ordering: it was the 2-bit file, and IQ3_S fixed it
 
-Measured 5 runs each on `3.10, 2.7, 3.9, 2.11`: **0/5 with thinking off, 2/5 with it on**, always
-failing the same way — `"3.10"` is parsed as the number `3.1` and then sorted
-lexicographically to `[2.11, 2.7, 3.1, 3.9]`. That is a 1.89-bit quantisation limit, not a prompt
-bug, and thinking does not fix it. Plain string and plain number ordering is fine. The routing
-guidance says so explicitly.
+Measured 5 runs each on the IQ2_XS engine: **0/5 with thinking off, 2/5 with it on**, always failing
+the same way — `"3.10"` was parsed as the number `3.1` and then sorted lexicographically to
+`[2.11, 2.7, 3.1, 3.9]`. That was a 1.89-bit quantisation limit, not a prompt bug, and thinking did
+not fix it. **Re-measured 2026-10-15 on the IQ3_S engine that replaced it: the same task returned
+`["2.7","2.11","3.9","3.10"]` — correct — in all three sampling configurations** (6/6 tool tasks in
+each, `bench-toolmodel.py`). The routing guidance still asks for a `json_order` gate on such a task,
+because a wrong order is caught for the price of one local call. Plain string and plain number
+ordering is fine either way.
 
 ### Contract facts verified against the live harness
 
 | fact | how |
 |---|---|
-| `strata/qwen3.8-flash-next-iq2_xs` is a live route | `list_subagent_models provider=strata` |
+| `strata/qwen3.8-flash-next-iq3_s` is a live route | `list_subagent_models provider=strata`; the route check reads the provider row's model list, so a swap is not complete until DSH restarts |
 | a delegated task round-trips correctly | sent a 3-line extraction; got `["alpha","delta","zeta"]` |
 | **no reasoning effort may be sent** — the provider rejects one it does not advertise | `subagent(provider=strata, reasoning_effort='none')` → `provider "strata" model "…" does not support reasoning effort "none"`, before any request is sent |
-| the engine is up and greedy | `GET /health` → `{"status":"ok","model":"qwen3.8-flash-next-iq2_xs","loaded":true}` |
+| the engine is up and greedy | `GET /health` → `{"status":"ok","model":"qwen3.8-flash-next-iq3_s","loaded":true}`; `GET /settings` → `{"shared":true,"defaults":{"reasoning_effort":"low"}}` — no temperature, which is what keeps it greedy |
 | the attachment store takes encoded **bytes**, not base64 | in `app.asar`: `SaveImageAttachment { data: Uint8Array; … }`, `probeImage` → `sharp(data)`, and the wire adapter `saveInput` does `decodeBase64(image.data)` |
 | a preset module instance is loaded **once per DSH process** | DSH started `18:12:02`, the module was rewritten `18:16:32`, a session opened `18:26` still reported the old `retries` default (`attempts=2`); see *Installing and editing* |
 | what a delegated child can actually reach | its own transcript: `list_subagent_models` works, `subagent` exists but is always refused (`depth 2 exceeds maxDepth 1`), `workflow` is `unknown tool` (3 attempts, nothing written) |
@@ -546,7 +563,7 @@ the field rather than failing, so the engine's shared default decides the effort
        providers:
          strata:
            models:
-             - id: qwen3.8-flash-next-iq2_xs
+             - id: qwen3.8-flash-next-iq3_s
                reasoningEfforts:
                  off: none
                  low: low
@@ -558,7 +575,7 @@ the field rather than failing, so the engine's shared default decides the effort
 | Variable | Default | Effect |
 |---|---|---|
 | `DSH_LOCAL_PROVIDER` | `strata` | provider route for the delegated child |
-| `DSH_LOCAL_MODEL` | `qwen3.8-flash-next-iq2_xs` | model id |
+| `DSH_LOCAL_MODEL` | `qwen3.8-flash-next-iq3_s` | model id |
 | `DSH_LOCAL_REASONING_EFFORT` | *(empty)* | per-call effort; empty omits the field (see above) |
 | `DSH_LOCAL_STRIP_TOOLS` | `1` | `0` keeps the child's inherited tool surface |
 | `DSH_LOCAL_CHILD_PERSONA` | a two-line tool-model persona | shadows the child's `deployment:persona-prefix` |
@@ -963,7 +980,7 @@ These are stated rather than hidden, in the same spirit as the measurements abov
   turn, and walked the entire `reasoning_effort` ladder (`medium` ×40, `low`/`none`/`minimal` ×21
   each, `high`/`xhigh`/`max` ×20 each) chasing an error it could not escape: this engine advertises
   **no** reasoning effort, so every attempt returned
-  `provider "strata" model "qwen3.8-flash-next-iq2_xs" does not support reasoning effort "X"`.
+  `provider "strata" model "<LOCAL_MODEL>" does not support reasoning effort "X"`.
   The child's own transcript records the shape exactly — 173 `step/start`, 173 `step/end`, 172
   `assistant/message`, 172 `tool/call`, 172 `tool/result`, **169 of the results errors** — spanning
   **341 s** and **24,500 output tokens**, with its prompt growing ~193 tokens per step from 1,970 to
@@ -1044,14 +1061,14 @@ These are stated rather than hidden, in the same spirit as the measurements abov
   and the third copy the script writes, `$DSH_HOME/.agent-presets/hybrid-router/`, is read by
   nobody — the running build says so in its own words: *"Nothing reads that directory any more."*
 
-- **The guide's semantic-version warning is conservative, and this engine disagreed with it.** The
-  routing guide tells the caller not to delegate semantic-version ordering, on the strength of a
-  measured 5/5 local failure rate (3/5 with the thinking channel on). From a session that loaded
-  this revision, two such tasks came back correct on the first attempt and passed:
-  `["3.10","2.7","3.9","2.11"]` → `["2.7","2.11","3.9","3.10"]` and
-  `["1.12","1.2","1.9","1.10"]` → `["1.2","1.9","1.10","1.12"]`. Two samples do not retire a rule
-  backed by ten, so the guide keeps it; but a task refused on that rule alone is worth one re-check
-  against whatever engine is actually loaded.
+- **The semantic-version warning was about the 2-bit file, and the IQ3_S swap retired it.** The
+  routing guide once told the caller not to delegate semantic-version ordering, on the strength of a
+  measured 5/5 local failure rate (3/5 with the thinking channel on) on the IQ2_XS engine. Two
+  re-checks on that same file already disagreed (`["3.10","2.7","3.9","2.11"]` →
+  `["2.7","2.11","3.9","3.10"]` and `["1.12","1.2","1.9","1.10"]` → `["1.2","1.9","1.10","1.12"]`),
+  and on 2026-10-15 the IQ3_S engine that replaced it passed the task in all three sampling
+  configurations (6/6 tool tasks in each). The guide now asks for a `json_order` gate instead of a
+  refusal, and the numbers above are kept as the record of what the 2-bit file did.
 
 - **A harness upgrade can invalidate the base list.** That is what the generator is for; do not
   hand-edit `cordis.patch.yml`.
