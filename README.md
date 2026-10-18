@@ -331,6 +331,27 @@ node   tools\session-headers.mjs --preset hybrid-router --blank   # 期望 0
 > ⚠️ **一次性的自检崩溃**（观测过、未复现）：一条命令里连跑多个 node/python 时，自检曾以 `exit=-1073740791`（`0xC0000409`）
 > 中断。**先原样复跑一次**，不要当成预设的缺陷。
 
+### 坑：`standard` 基线可能带着一个**新构建已不再注册**的提示词变量
+
+persona 的 `prefix`/`suffix` 是**模板**：提示词注册表对每个 `{{…}}` 严格解析，未注册的变量会让
+**提示词组装**直接失败——发生在任何模型请求之前，所以用这个预设的每个会话都起不来，也没有自己的 transcript。
+2026-10-18 在桌面版 0.2.0-rc.2 上实测：
+
+```text
+unknown prompt variable "{{cwd}}" in section "deployment:persona-suffix"; registered variables: provider, model
+```
+
+这句来自 `standard` 基线**逐字拷贝**过来的旧行 `suffix: Your working directory is {{cwd}}.`。当前构建把它删了，
+因为工作目录改由工作目录服务作为**字面用户上下文**提供、不再有该变量——所以这句既渲染不了也多余。重新生成即可
+去掉；并且 `tools/build-local-delegate-preset.py` 现在会**拒绝**写出 `{provider, model}` 之外任何 `{{…}}`
+（`--selftest` 钉住这条，守卫不会被悄悄改松）。**它治不了的两件事**：
+
+- **生效仍需重启 DSH**：组合是进程启动时读的。撞上这个错的进程会把那句坏 suffix 留在内存里，文件改对了、
+  新建会话照样失败。2026-10-18 那次的进程起于 14:20:16，文件修于 14:23:14——这两个时间点看起来就像"修了没用"。
+- **profile 里这份 bundle 是指向源码目录的硬链接**（`nlink = 2`，2026-10-18 核实），所以改源码会**同时**改掉
+  已安装的预设，`sync-install --check` 对那个文件永远不会报 stale。方便，但如果你以为"install 那一步才让文件变"，
+  它就是个陷阱。
+
 ---
 
 ## 十三、文件清单

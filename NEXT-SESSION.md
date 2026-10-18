@@ -1,5 +1,56 @@
 # 新会话交接单 — `local-delegate` 预设的收尾验证
 
+## 最新一轮（2026-10-18）：预设在新桌面版上**全线失败**——`{{cwd}}`（已修，**待重启 DSH**）
+
+> **本节优先于下面所有记录。**
+
+### 症状（用户原话）
+
+```
+unknown prompt variable "{{cwd}}" in section "deployment:persona-suffix"; registered variables: provider, model
+```
+
+用这个预设的**每个新会话都起不来**。注意它没有自己的 transcript：失败发生在**提示词组装**阶段、任何模型请求之前，
+所以按"看会话记录找线索"的路子会一无所获。
+
+### 根因
+
+`cordis.patch.yml` 是 `standard` 基线**逐字拷贝**的，而旧基线里带着这一行：
+
+```yaml
+- id: persona
+  config:
+    prefix: You are a coding agent powered by the {{model}} model.
+    suffix: Your working directory is {{cwd}}.
+```
+
+persona 的 `prefix`/`suffix` 是**模板**，提示词注册表对 `{{…}}` 严格解析；当前构建（桌面版 0.2.0-rc.2）只注册
+`provider` 和 `model`——工作目录改由**工作目录服务**作为字面用户上下文提供，`cwd` 这个变量已经不存在。
+所以那句 suffix 既渲染不了也多余。这不是"换模型"带来的，是**跟随基线拷贝**带来的漂移。
+
+### 已做的修复
+
+1. 重新生成 `cordis.patch.yml`（顺带修正了基线的真实漂移：新增 `time-context`、`tool-schedule`，
+   少了 codex/claude-code 两个 subagent 行，plan-mode 文案更新）——suffix 那行随之消失。
+2. `tools/build-local-delegate-preset.py` 加了守卫 `check_prompt_variables()`：写出前拒绝 `{{provider, model}}`
+   之外的任何 `{{…}}`，并打印行号与成因；`--selftest` 用一段合成的 `{{cwd}}` 钉住这条（变异证明：
+   对旧版本报 1 条、对新版本报 0 条）。
+3. README.md / README.en.md 各加一节记录此坑。
+
+### 还差一步：**重启 DSH 本体**
+
+组合是**进程启动时**读的。这次的进程起于 **14:20:16**，文件修于 **14:23:14**——进程内存里仍是那句坏 suffix，
+所以**现在新建会话照样失败**。重启后才会读到修好的组合。换模型那次的教训在这里再次适用：文件对了 ≠ 生效了。
+
+### 附带核实（值得记住）
+
+- profile 里那份 bundle 与源码目录是**硬链接**（`nlink = 2`，`ino` 相同），所以改源码会同时改掉"已安装"的预设，
+  `sync-install --check` 对 `cordis.patch.yml` **永远不会**报 stale。别把它当成"还没 install"。
+- 本地引擎此刻**没在跑**（`127.0.0.1:8080` 拒绝连接），所以 selftest 要用 `DSH_SKIP_ENGINE_PROBE=1` 跑（229/0）；
+  真发委派前先起引擎。
+
+---
+
 ## 最新一轮（2026-10-15）：本地模型 **IQ2_XS → IQ3_S**
 
 > **本节优先于下面所有记录。** 读这一节就能开工。

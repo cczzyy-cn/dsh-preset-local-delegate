@@ -721,6 +721,33 @@ python tools/validate-preset-bundle.py dsh-preset-local-delegate
 it and diff against `python tools/dump-shipped-preset.py standard --body-only` — that diff is the
 whole claim of this preset, so it should only ever be the one added row.
 
+### The shipped base can carry a dead prompt variable
+
+A persona `prefix`/`suffix` is a *template*: the prompt registry resolves every `{{…}}` group
+strictly, and an unregistered name fails **prompt assembly** — before any model request, so every
+session on the preset dies and writes no transcript of its own. Measured 2026-10-18 on this
+deployment, desktop build 0.2.0-rc.2:
+
+```text
+unknown prompt variable "{{cwd}}" in section "deployment:persona-suffix"; registered variables: provider, model
+```
+
+The clause came along verbatim from the shipped `standard` preset, which used to say
+`suffix: Your working directory is {{cwd}}.`. The current build dropped that line because the
+working directory now arrives as **literal user context** from the working-directory service, so
+the variable does not exist and the clause is both unrenderable and redundant. Regenerating removes
+it, and the generator now **refuses** to emit any `{{…}}` outside `{provider, model}`
+(`--selftest` pins that, so the guard cannot be quietly weakened). Two things it does not fix:
+
+- **The fix needs a DSH restart**, like every other preset edit. The composition is read at process
+  start: the app that hit the error keeps the dead suffix in memory and keeps failing new sessions
+  even after the file on disk is correct. In the 2026-10-18 incident the process had started at
+  14:20:16 and the file was fixed at 14:23:14 — the two facts that look like "the fix did not work".
+- **The profile copy of this bundle is a hard link** (`nlink = 2`) to the checkout, verified
+  2026-10-18, so editing the source silently edits the *installed* preset: `sync-install --check`
+  can never report that file stale. Convenient, and a trap if you expect an install step to be the
+  moment the live file changes.
+
 ## Honest boundaries
 
 These are stated rather than hidden, in the same spirit as the measurements above.
