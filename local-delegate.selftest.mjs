@@ -33,6 +33,29 @@ let passed = 0
 let failed = 0
 let skipped = 0
 
+// OFFLINE BY DEFAULT. Every generation in this file goes to a FAKE provider, so no case actually
+// needs a running engine — only `assertLocalEngine`'s preflight does, and it insists on one. Before
+// this, `npm test` on a machine whose 8080 is closed died with "local engine unreachable" (measured
+// 2026-10-18), which reads like a broken suite rather than a missing daemon. Probe once: if the
+// engine is absent, bypass the preflight and say so. `DSH_REQUIRE_ENGINE=1` restores the fail-fast
+// behaviour for anyone who wants the suite to prove it ran against a live engine.
+const ENGINE_HOST = process.env.DSH_STRATA_HOST || '127.0.0.1'
+const ENGINE_PORT = Number(process.env.DSH_STRATA_PORT || 8080)
+let engineUp = false
+try {
+  engineUp = await probeEngine(ENGINE_HOST, ENGINE_PORT)
+} catch {
+  engineUp = false
+}
+if (!engineUp) {
+  if (process.env.DSH_REQUIRE_ENGINE === '1') {
+    console.error(`FAIL no local engine on ${ENGINE_HOST}:${ENGINE_PORT} and DSH_REQUIRE_ENGINE=1`)
+    process.exit(1)
+  }
+  process.env.DSH_SKIP_ENGINE_PROBE = '1'
+  console.log(`# no local engine on ${ENGINE_HOST}:${ENGINE_PORT} — offline run (preflight bypassed; generations are fakes)`)
+}
+
 function ok(name, cond, detail) {
   if (cond) {
     passed += 1
@@ -495,6 +518,19 @@ const verifySchema = dbDef.parameters.properties.tasks.items.properties.verify
 ok('every kind checkInner implements is in VERIFIER_KINDS',
   JSON.stringify(implementedKinds) === JSON.stringify([...VERIFIER_KIND_IDS].sort()),
   `implemented=${implementedKinds.join(', ')} | table=${VERIFIER_KIND_IDS.join(', ')}`)
+// ONE source for the deployment's engine facts. A model swap touches the engine, the profile route,
+// the compaction policy and this module's default; any one of them left behind produces a refusal
+// that reads like a preset bug ("route ... is not allowed"). `engine-profile.json` is that source,
+// and these two cases pin the module and the file together so the drift cannot pass `npm test`.
+const engineProfile = JSON.parse(
+  readFileSync(fileURLToPath(new URL('./engine-profile.json', import.meta.url)), 'utf8'))
+const moduleModel = /DSH_LOCAL_MODEL \|\| '([^']+)'/.exec(moduleSource)?.[1]
+ok('the module default model matches engine-profile.json',
+  moduleModel === engineProfile.model,
+  `module=${moduleModel} | engine-profile=${engineProfile.model}`)
+ok('engine-profile.json leaves prompt room (0 < maxTokens < maxContext)',
+  engineProfile.maxTokens > 0 && engineProfile.maxTokens < engineProfile.maxContext,
+  `maxTokens=${engineProfile.maxTokens} maxContext=${engineProfile.maxContext}`)
 ok('the verify_task description names every kind (five were missing before)',
   VERIFIER_KIND_IDS.every((id) => verifyDef.description.includes(id)),
   VERIFIER_KIND_IDS.filter((id) => !verifyDef.description.includes(id)).join(', '))
@@ -561,6 +597,36 @@ ok('the delegated child request is the stripped local one',
 ok('every run is disposed', happy.disposed === 1)
 ok('the render echoes the raw answer so the caller can read what it paid for',
   /raw: \[1\]/.test(happyTool.output.render({}, happyResult)[0].text))
+
+// The ledger is the only receipt that outlives the turn: the footer says what a batch cost, but the
+// question "which task shapes actually paid off this week" is asked later, by `scripts/ledger.mjs`.
+// The path is read per call (not at import), which is what lets this case point it at a temp file and
+// what keeps a read-only HOME from ever breaking a delegation.
+{
+  const ledger = join(tmpdir(), `local-delegate-ledger-${process.pid}.jsonl`)
+  try { rmSync(ledger) } catch { /* fresh */ }
+  process.env.DSH_LOCAL_LEDGER = ledger
+  const ledgerCtx = fakeCtx({ effect: true, subagents: fakeSubagents(['[1]']) })
+  apply(ledgerCtx.ctx)
+  const ledgerTool = ledgerCtx.tools.find((t) => t.name === 'delegate_batch')
+  await ledgerTool.execute({ tasks: [{ description: 'a', prompt: 'p', verify }] }, { agent: { id: 'parent' } })
+  const rows = readFileSync(ledger, 'utf8').trim().split('\n').map((l) => JSON.parse(l))
+  ok('a batch appends exactly one ledger row, with its cost and its kinds',
+    rows.length === 1 && rows[0].tasks === 1 && rows[0].passed === 1
+    && Array.isArray(rows[0].kinds) && rows[0].kinds[0] === 'json_equals'
+    && typeof rows[0].tokens?.prompt === 'number',
+    JSON.stringify(rows[0]))
+  // `DSH_LOCAL_LEDGER=0` is the documented off switch, and it must be honoured per call, not once.
+  process.env.DSH_LOCAL_LEDGER = '0'
+  const offCtx = fakeCtx({ effect: true, subagents: fakeSubagents(['[1]']) })
+  apply(offCtx.ctx)
+  await offCtx.tools.find((t) => t.name === 'delegate_batch')
+    .execute({ tasks: [{ description: 'a', prompt: 'p', verify }] }, { agent: { id: 'parent' } })
+  ok('DSH_LOCAL_LEDGER=0 turns the ledger off',
+    readFileSync(ledger, 'utf8').trim().split('\n').length === 1)
+  rmSync(ledger, { force: true })
+  delete process.env.DSH_LOCAL_LEDGER
+}
 
 // A failure must retry ONCE, then escalate — and must not abort the tasks after it.
 // (Explicit `retries: 1`: the DEFAULT is 0, which the next block tests.)

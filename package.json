@@ -11,9 +11,17 @@
   },
   "scripts": {
     "test": "node local-delegate.selftest.mjs",
+    "doctor": "node scripts/doctor.mjs",
+    "check:docs": "node scripts/check-docs.mjs",
+    "ledger": "node scripts/ledger.mjs",
     "trace": "node scripts/subagent-trace.mjs",
     "sync": "node scripts/sync-install.mjs",
-    "sync:check": "node scripts/sync-install.mjs --check"
+    "sync:check": "node scripts/sync-install.mjs --check",
+    "gen": "python tools/build-local-delegate-preset.py",
+    "gen:check": "python tools/build-local-delegate-preset.py --check",
+    "gen:selftest": "python tools/build-local-delegate-preset.py --selftest",
+    "validate": "python tools/validate-preset-bundle.py .",
+    "roster": "python tools/check-profile-roster.py"
   },
   "exports": {
     "./cordis.patch.yml": "./cordis.patch.yml",
@@ -21,6 +29,7 @@
   },
   "files": [
     "cordis.patch.yml",
+    "engine-profile.json",
     "*.mjs",
     "README*.md",
     "scripts/"

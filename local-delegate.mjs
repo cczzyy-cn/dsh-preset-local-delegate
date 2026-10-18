@@ -25,9 +25,9 @@
  */
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { writeFileSync, readFileSync, mkdtempSync, mkdirSync, rmSync } from 'node:fs'
+import { writeFileSync, readFileSync, mkdtempSync, mkdirSync, rmSync, appendFileSync } from 'node:fs'
 import { join, extname, basename } from 'node:path'
-import { tmpdir } from 'node:os'
+import { tmpdir, homedir } from 'node:os'
 import net from 'node:net'
 
 export const name = 'local-delegate'
@@ -208,6 +208,41 @@ const OUTPUT_CHARS = Number(process.env.DSH_DELEGATE_OUTPUT_CHARS || 500)
 
 const ENGINE_HOST = process.env.DSH_STRATA_HOST || '127.0.0.1'
 const ENGINE_PORT = Number(process.env.DSH_STRATA_PORT || 8080)
+
+/**
+ * THE LEDGER — one JSON line per batch, appended to `$DSH_HOME/local-delegate-ledger.jsonl`.
+ *
+ * WHY. The batch footer already reports what one batch cost ("0 API tokens", local tokens spent),
+ * but a footer dies with the turn: nothing could answer "what did this preset actually save me this
+ * week, and on which task shapes", which is the only evidence that matters when deciding what to
+ * delegate tomorrow. The row is deliberately flat and boring so it can be summed by shell tooling:
+ *
+ *   { ts, provider, model, tasks, passed, failed, kinds, retried, localMs,
+ *     tokens: { prompt, read, reused, generated }, cwd }
+ *
+ * Bookkeeping must never break a delegation (a read-only HOME, a full disk), so every failure here
+ * is swallowed. `DSH_LOCAL_LEDGER=0` disables it; any other value is the file to append to.
+ */
+const LEDGER_ENV_OFF = new Set(['0', 'off', 'false'])
+
+/** Read per call, like `fileChars`, so the self-test can point the ledger at a temp file. */
+function ledgerFile() {
+  const configured = process.env.DSH_LOCAL_LEDGER
+  if (configured && LEDGER_ENV_OFF.has(configured.toLowerCase())) return ''
+  if (configured) return configured
+  const home = process.env.DSH_HOME || join(homedir(), '.dsh')
+  return join(home, 'local-delegate-ledger.jsonl')
+}
+
+function appendLedger(row) {
+  const file = ledgerFile()
+  if (!file) return
+  try {
+    appendFileSync(file, `${JSON.stringify(row)}\n`)
+  } catch {
+    /* never fail a delegation for bookkeeping */
+  }
+}
 
 const VERIFY_PYTHON = process.env.DSH_VERIFY_PYTHON || process.env.CVISION_PYTHON || 'python'
 
@@ -1992,6 +2027,27 @@ export function apply(ctx) {
         if (cost) last.tokens = cost
         results.push(last)
       }
+      // One line per batch — the same receipt the footer prints, but persistent, so the preset can
+      // answer "what did this cost and what did it catch" after the transcript is gone. Written on a
+      // FAIL too: the failures are the interesting rows.
+      appendLedger({
+        ts: new Date().toISOString(),
+        provider: LOCAL_PROVIDER,
+        model: LOCAL_MODEL,
+        tasks: results.length,
+        passed: results.filter((r) => r.ok === true).length,
+        failed: results.filter((r) => r.ok === false).length,
+        kinds: [...new Set(tasks.map((t) => t?.verify?.kind).filter(Boolean))],
+        retried: results.filter((r) => (r.attempts || 0) > 1).length,
+        localMs: results.reduce((n, r) => n + (Number.isFinite(r.spentMs) ? r.spentMs : (Number.isFinite(r.ms) ? r.ms : 0)), 0),
+        tokens: results.reduce((a, r) => ({
+          prompt: a.prompt + (r.tokens?.prompt ?? 0),
+          read: a.read + (r.tokens?.read ?? 0),
+          reused: a.reused + (r.tokens?.reused ?? 0),
+          generated: a.generated + (r.tokens?.generated ?? 0),
+        }), { prompt: 0, read: 0, reused: 0, generated: 0 }),
+        cwd: process.cwd(),
+      })
       return { results }
     },
   })

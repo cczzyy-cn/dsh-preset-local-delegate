@@ -1,0 +1,19 @@
+{
+  "provider": "strata",
+  "baseURL": "http://127.0.0.1:8080/v1",
+  "model": "qwen3.8-flash-next-iq3_xxs",
+  "engineVersion": "0.1.44.1",
+  "maxContext": 262144,
+  "maxTokens": 32768,
+  "images": true,
+  "reasoningEffort": "low",
+  "sampling": {
+    "temperature": 0,
+    "mustStayOutOfSharedSettings": ["temperature", "top_p", "min_p", "top_k"]
+  },
+  "capabilities": {
+    "semverOrdering": true,
+    "multistepArithmetic": "wrong at reasoning_effort none (9/18), right at low (18/18)"
+  },
+  "measuredOn": "2026-10-16"
+}
